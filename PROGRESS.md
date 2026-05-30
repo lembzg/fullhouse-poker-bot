@@ -1,11 +1,11 @@
 # PROGRESS.md — living state (update + commit WITH every phase checkpoint)
 
-- **Last updated:** 2026-05-30 21:33 BST
-- **HEAD:** `7556ee5` (Phase 4a checkpoint)  ·  **branch:** `mybot`
-- **NEXT STEP:** **Phase 4b** — postflop board-texture features + c-bet / barrel /
-  check-raise / bluff-catch logic + value/bluff sizing (one-pair pot growth when
-  checked to is currently deferred to baseline; tighten sizing here). Phase 4a
-  (made-hand CLASS + SPR over-commitment guard) is DONE. Keep exploit-ready.
+- **Last updated:** 2026-05-30 22:40 BST
+- **HEAD:** `7ca9622` (Phase 4b checkpoint)  ·  **branch:** `mybot`
+- **NEXT STEP:** **HARD-STOP — Phase 5 needs explicit user sign-off.** Phase 4 is
+  DONE (4a guard + 4b texture/sizing/bluff-catch). Phase 5 = opponent modelling +
+  exploitation; the deferred 4b bluff initiative (c-bet / barrel / semibluff /
+  check-raise) folds into it because its EV is opponent-conditional.
 - **How to resume:** `git checkout mybot` → read this file + `git log --oneline -10`
   → `python3 tools/harness.py` for the current baseline → continue at NEXT STEP.
 
@@ -22,7 +22,7 @@ unprompted. Each phase ends on a runnable, validator-passing checkpoint.
 | 1 — Safe skeleton | ✅ DONE | `529c568` |
 | 2 — Equity core (MC, eval7) | ✅ DONE | `2eb1b55`; tooling `1a9e319`; repro harness `4ed130c` |
 | 3 — Preflop as precomputed charts | ✅ DONE | `44b72c8` (docs `370bc33`) |
-| 4 — Postflop (texture, SPR, pot control) | 🟡 4a DONE / 4b NEXT | 4a: `7556ee5` |
+| 4 — Postflop (texture, SPR, pot control) | ✅ DONE | 4a `7556ee5` · 4b `7ca9622` |
 | 5 — Opponent modelling + exploitation | ◻ TODO (HARD-STOP before) | — |
 | 6 — Test harness + tuning + regression gate | ◻ TODO | — |
 | 7 — Package + validate + BOT_README | ◻ TODO | — |
@@ -84,7 +84,14 @@ unprompted. Each phase ends on a runnable, validator-passing checkpoint.
   than baseline (verified: 0 new busts in the 30-seed A/B). NOT blanket call-bar
   tightening (measured −EV). Full postflop sizing/pot-growth control → Phase 4b.
 - **vs-random equity is optimistic** against value-heavy ranges → over-calls vs
-  tight opponents. Fix via range modelling (Phase 4) + per-opponent reads (Phase 5).
+  tight opponents. Phase 4b adds texture+SPR-priced bluff-catching (folds marginal
+  more on wet, calls wider when committed); full fix needs per-opponent reads
+  (Phase 5).
+- **Unconditional postflop bluffing is −EV in this format** (Phase 4b finding) —
+  c-bets / barrels / semibluffs add variance, and variance is −EV in a bust-
+  elimination format (busts cost a fixed −10k floor). Their EV is opponent-
+  conditional → only profitable once we can c-bet the folders and never the
+  aggressor. **Deferred to Phase 5.**
 - ~~Preflop noisy MC~~ → **RESOLVED Phase 3**: O(1) chart lookup (position ×
   facing × stack bucket); push/fold gated at eff ≤ 15bb (100bb never shoves);
   HU ranges for the endgame. Uncovered spots still fall back to MC.
@@ -116,13 +123,35 @@ unprompted. Each phase ends on a runnable, validator-passing checkpoint.
   catastrophic deep stack-off that matters vs the stronger 500-bot field, not an
   EV boost vs these refs.
 
+## Phase 4b notes (board texture + polarized sizing + texture-priced bluff-catch)
+- New in `bot.py`: `_board_texture` (wet/dry: live flush or straighty), and
+  `_postflop_strategy` — class+texture VALUE sizing (small dry / large wet),
+  marginal made hands take thin value on dry only & pot-control on wet, and
+  bluff-catch priced by texture (+0.05 eq bar on wet) + SPR (−0.03 when committed).
+  Runs AFTER the 4a guard (structurally preserved — guard handles the stack-offs
+  first; verified it still fires first).
+- **What we built then DROPPED (and why):** a full bluff layer (c-bet bluffs,
+  turn barrels, semibluff bets, semibluff check-raise + draw/lead/all-in helpers).
+  200-seed paired A/B vs 4a: **mean −1,516, 95% CI [−2,893, −140], p=0.032 — a
+  real (if small) regression**, busts 33→42/200. Variance is −EV here (bust floor
+  −10k). The 30-seed point estimate (−3,955) was noise-inflated; the larger run
+  both shrank and sharpened it. Bluff EV is opponent-conditional → deferred to P5.
+- **What we KEPT (committed):** trimmed 4b = value sizing + texture/SPR bluff-catch
+  only. 200-seed paired A/B vs 4a: **mean −607, 95% CI [−1,789, +576], p=0.32 —
+  statistically NEUTRAL**, busts 35 vs 33/200. Clears the agreed bar (CI must not
+  exclude zero on the downside). Committed for the structural refinement + as the
+  texture/class scaffolding Phase 5 will gate by opponent.
+- **Methodology note:** postflop changes cascade (one different flop bet reshuffles
+  all 400 hands), so 30 seeds is too noisy to judge them — use ≥200-seed PAIRED
+  A/B (common random numbers) + a t-test, not point estimates.
+
 ## Current performance (baseline to beat)
-Deterministic 30-seed A/B (harness.py: seeded refs + `BOT_RNG_SEED`, common
-random numbers), paired vs the previous checkpoint:
-- **Phase 4a: mean +16,804, 24/30 table-wins, 5 busts** (paired +50 vs Phase 3;
-  the 1 seed the guard touched improved +45.9k→+47.4k; 0 new busts).
-- Phase 3 charts: mean +16,754 (this harness) / +16.3k (earlier 40-seed run),
-  24/30 wins, 5 busts.
-- Phase 2 (pre-charts): mean +11.5k, 32/40 wins, 5 busts. 0 bot_errors.
+Deterministic PAIRED A/B (harness.py: seeded refs + `BOT_RNG_SEED`, common random
+numbers):
+- **Phase 4b: statistically neutral vs 4a** (200-seed paired diff −607,
+  CI [−1,789, +576], p=0.32; busts 35 vs 33/200). Mean level ≈ +15.2k.
+- Phase 4a: mean +16,804 (30-seed) / +15,868 (200-seed), ~24/30 wins, 5 busts;
+  paired +50 vs Phase 3, 0 new busts.
+- Phase 3 charts: mean +16,754 (30-seed). Phase 2: +11.5k.
 Validator: PASSED. Equity: 5/5. Worst-case `decide()` ~4 ms (~8 ms @ 0.5 core);
-guard caps 1.2 s. Determinism: `harness.py --check` = YES.
+budget caps 1.2 s. Determinism: `harness.py --check` = YES.

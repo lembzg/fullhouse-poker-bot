@@ -717,6 +717,14 @@ _SPR_COMMIT    = 1.5    # SPR at/below this = committed; a lone weak pair may ca
 _STACKOFF_FRAC = 0.6    # a call >= this fraction of remaining stack ~= stacking off
 _STACKOFF_EQ   = 0.85   # only commit a lone weak pair for stacks at/above this equity
 
+# --- Phase 4b: texture-split bet sizing (polarized) -------------------------
+# Value and bluff use the SAME size on a given texture (balanced/polarized), so
+# sizing isn't a value/bluff tell: small on DRY boards, larger on WET boards
+# (charge draws, build the pot when our strong range is uncapped). Principled
+# defaults; grid-tune in Phase 6.
+_SIZE_DRY      = 0.45   # bet/raise as a fraction of pot, added on top, on dry boards
+_SIZE_WET      = 0.70   # bet/raise fraction on wet boards
+
 
 def _preflop_raise_target(p):
     """Open / re-raise sizing preflop: ~3x the current bet (a standard ~3bb open
@@ -819,6 +827,102 @@ def _postflop_overcommit_guard(p, eq):
     return None                             # else: baseline (call if priced, else fold)
 
 
+# ===========================================================================
+# PHASE 4b — board texture + polarized sizing + texture-priced bluff-catch
+# ===========================================================================
+# SHIPPED (200-seed paired A/B vs 4a: mean diff -607, 95% CI [-1789, +576],
+# p=0.32 -> statistically neutral; clears the no-downside-regression bar):
+#   - texture-split VALUE sizing (small on dry, larger/polarized on wet);
+#   - marginal made hands: thin value on dry only, pot-control (check) on wet;
+#   - bluff-catch priced by board texture + SPR.
+# DEFERRED to Phase 5 because their EV is opponent-CONDITIONAL (c-bet the
+# folders, never the aggressor): c-bet bluffs, turn barrels, semibluff bets and
+# the semibluff check-raise. Unconditional, they measured ~-1.5k/match and added
+# busts vs this field (variance is -EV in a bust-elimination format).
+
+def _board_texture(board):
+    """Coarse wet/dry read. WET = live flush (two+ of a suit while cards are
+    still to come, or three+ of a suit) OR straighty (three board cards inside a
+    five-rank window). DRY = e.g. K72 rainbow. Drives polarized bet sizing and
+    how credible an opponent's bet is."""
+    suit_ct, rvals = {}, []
+    for c in board:
+        if len(c) < 2:
+            continue
+        suit_ct[c[1]] = suit_ct.get(c[1], 0) + 1
+        v = _RANK_VAL.get(c[0])
+        if v is not None:
+            rvals.append(v)
+    max_suit = max(suit_ct.values()) if suit_ct else 0
+    live = len(board) < 5
+    flushy = max_suit >= 3 or (max_suit >= 2 and live)
+    uniq = sorted(set(rvals))
+    if 14 in uniq:                                  # ace also plays low (wheel)
+        uniq = sorted(set(uniq + [1]))
+    straighty = any(sum(1 for v in uniq if lo <= v <= lo + 4) >= 3 for lo in uniq)
+    return {"wet": flushy or straighty, "flushy": flushy,
+            "straighty": straighty, "paired": len(rvals) != len(set(rvals))}
+
+
+def _postflop_strategy(p, eq):
+    """Phase 4b postflop layer: class- and texture-aware VALUE betting with
+    polarized (dry-small, wet-large) sizing, plus bluff-catching priced by
+    texture + SPR. Runs AFTER the Phase 4a over-commitment guard, so the
+    dangerous one-pair stack-offs are already handled and cannot reach here.
+    Returns None only for unclassifiable hands -> defers to baseline equity.
+    (Bluff/semibluff initiative is intentionally absent -> deferred to the
+    opponent-conditional Phase 5; see the section header.)"""
+    klass = _made_hand_class(p)
+    if klass is None:
+        return None
+    wet = _board_texture(p["community"])["wet"]
+    size = _SIZE_WET if wet else _SIZE_DRY
+    req = _required_equity(p)
+
+    if p["can_check"]:
+        # No bet to us: value-bet with polarized sizing. Marginal made hands take
+        # thin value on dry boards only (pot-control / check when wet); a hand
+        # with no value just checks (no bluffing in this build).
+        if klass in ("STRONG", "MEDIUM") and eq >= _VALUE_BET_EQ:
+            return _make_raise(p, _bet_target(p, size))          # value, polarized size
+        if klass == "MARGINAL" and eq >= _VALUE_BET_EQ and not wet:
+            return _make_raise(p, _bet_target(p, _SIZE_DRY))     # thin value, dry only
+        return {"action": "check"}                               # pot control / give up
+
+    # ---- Facing a bet --------------------------------------------------------
+    if klass == "STRONG":
+        if eq >= _VALUE_RAISE_EQ:
+            return _make_raise(p, _bet_target(p, size))
+        if eq >= req + _CALL_CUSHION:
+            return _call_or_check(p)
+        return {"action": "fold"}
+
+    if klass == "MEDIUM":
+        # Overpair / TPGK: mirror baseline aggression (no EXTRA commitment beyond
+        # what the equity bar already allowed) — raise big eq, else call/fold.
+        if eq >= _VALUE_RAISE_EQ:
+            return _make_raise(p, _bet_target(p, 0.7))
+        if eq >= req + _CALL_CUSHION:
+            return _call_or_check(p)
+        return {"action": "fold"}
+
+    if klass == "MARGINAL":
+        # Bluff-catch priced by texture + SPR (the guard already folded the deep
+        # stack-offs and downgraded value-raises). A bet is more credible on wet
+        # boards (draws got there) -> need more equity; cheaper when committed.
+        bar = req + _CALL_CUSHION + (0.05 if wet else 0.0) \
+            - (0.03 if _spr(p) <= _SPR_COMMIT else 0.0)
+        if eq >= bar:
+            return _call_or_check(p)
+        return {"action": "fold"}
+
+    # WEAK: no made hand and no bluffing in this build — call only on a correct
+    # price (MC equity already reflects any draw), else fold.
+    if eq >= req + _CALL_CUSHION:
+        return _call_or_check(p)
+    return {"action": "fold"}
+
+
 def _strategy_action(p, deadline):
     """Equity vs pot odds. Bet/raise strong equity, call correct-priced draws,
     fold the rest. Deliberately simple — the exploit overlay rides on top later."""
@@ -847,12 +951,18 @@ def _strategy_action(p, deadline):
     req = _required_equity(p)
 
     # Phase 4a: a subtractive pot-control guard intercepts ONLY the one-pair
-    # over-commitment leak; everything else falls through to the baseline equity
+    # over-commitment leak; it runs FIRST so those stack-offs never reach the
+    # Phase 4b layer. Phase 4b then handles the full postflop decision (c-bet /
+    # barrel / check-raise / bluff-catch / polarized sizing). Either may return
+    # None for hands they can't classify -> fall through to the baseline equity
     # logic below (which also serves preflop spots the charts didn't cover).
     if p["street"] != "preflop":
         guard = _postflop_overcommit_guard(p, eq)
         if guard is not None:
             return guard
+        post = _postflop_strategy(p, eq)
+        if post is not None:
+            return post
 
     if p["can_check"]:
         # No bet to us: value-bet strong equity, otherwise take the free card.
