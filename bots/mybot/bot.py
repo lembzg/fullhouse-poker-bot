@@ -21,6 +21,21 @@ ALL Phase-1 safety guarantees are preserved:
 
 import time
 import random
+import os
+
+# --- Reproducibility hook (TEST-ONLY; off in production) -------------------
+# The Monte-Carlo sampler is stochastic, which makes regression comparisons
+# noisy. If (and ONLY if) the environment variable BOT_RNG_SEED is set at
+# module-import time, we route all sampling through a dedicated seeded RNG so a
+# (engine_seed, BOT_RNG_SEED) pair reproduces a match exactly. The tournament
+# never sets this var, so live play uses a fresh OS-entropy RNG and stays
+# stochastic / unexploitable. os.environ.get is an allowed call (not a banned
+# os.* function); read once at import, never during decide().
+_seed_env = os.environ.get("BOT_RNG_SEED")
+if _seed_env is not None and _seed_env.lstrip("-").isdigit():
+    _RNG = random.Random(int(_seed_env))
+else:
+    _RNG = random.Random()   # OS-seeded: production default, fully stochastic
 
 # eval7 is the engine's evaluator and is guaranteed present in the sandbox. We
 # still guard the import so a missing eval7 degrades to the cheap heuristic
@@ -171,7 +186,7 @@ def monte_carlo_equity(hero_cards, board_cards, opponents, iters, deadline=None)
         return 0.0                                    # not enough cards (bad input)
 
     evaluate = eval7.evaluate
-    sample = random.sample
+    sample = _RNG.sample          # seeded in tests, OS-entropy in production
     wins = 0.0
     done = 0
 
