@@ -60,6 +60,7 @@ TIME_BUDGET_S = 1.2
 _RANKS = "23456789TJQKA"
 _SUITS = "shdc"
 _RANK_VAL = {r: i for i, r in enumerate(_RANKS, start=2)}  # '2'->2 ... 'A'->14
+_BB = 100   # big blind in chips (engine config; blinds never escalate)
 
 # Pre-build the full 52-card deck ONCE at import time (warmup budget covers it).
 # Keyed by string so deck removal is a cheap set-membership test. Built only if
@@ -111,6 +112,7 @@ def _parse(state):
     p["min_raise_to"]  = max(0, int(_g(state, "min_raise_to", p["current_bet"])))
     p["players"]       = list(_g(state, "players", []))
     p["seat"]          = int(_g(state, "seat_to_act", -1))
+    p["action_log"]    = list(_g(state, "action_log", []))
     p["max_to"]        = p["bet_this"] + p["stack"]
     return p
 
@@ -288,6 +290,382 @@ def _preflop_proxy(cards):
 
 
 # ===========================================================================
+# PHASE 3 — Precomputed preflop charts (O(1) lookup; built once at import)
+# ===========================================================================
+# Ranges are written as compact, reviewable shorthand and EXPANDED into frozen
+# sets of 169 hand classes at import time (never inside decide()). Keying:
+#   position    : UTG / MP / CO / BTN / SB / BB  (HU uses SB=button, BB)
+#   facing      : unopened / vs_limp / vs_raise / vs_3bet / vs_4bet
+#   stack bucket: <=15bb -> Nash push/fold ;  >15bb -> sized open/call/3bet/4bet
+# A 100bb stack therefore NEVER hits a shove/fold node (push/fold is gated at
+# eff<=15bb). Spots the charts don't cover return None -> the Phase-2 MC takes
+# over, so charts can only add information, never regress coverage.
+#
+# Shorthand tokens understood by _expand():
+#   "AA"  pair            "AKs"/"AKo" single suited/offsuit
+#   "22+" pairs >= 22     "ATs+" Ax suited from T up      "KJo+" likewise
+#   "TT-22" pair range    "AQs-ATs" same-high suited range (descending hi->lo)
+
+_RANK_ORDER = "23456789TJQKA"
+_RIDX = {r: i for i, r in enumerate(_RANK_ORDER)}
+
+
+def _expand_token(tok):
+    tok = tok.strip()
+    if not tok:
+        return set()
+    # Range with a dash, e.g. "TT-22" or "AQs-ATs".
+    if "-" in tok:
+        a, b = tok.split("-", 1)
+        if len(a) == 2 and a[0] == a[1] and len(b) == 2:   # pair range
+            i, j = _RIDX[a[0]], _RIDX[b[0]]
+            lo, hi = min(i, j), max(i, j)
+            return {_RANK_ORDER[k] * 2 for k in range(lo, hi + 1)}
+        if len(a) == 3 and len(b) == 3:                    # suited/offsuit range
+            hi, su = a[0], a[2]
+            i, j = _RIDX[a[1]], _RIDX[b[1]]
+            lo_i, hi_i = min(i, j), max(i, j)
+            return {hi + _RANK_ORDER[k] + su for k in range(lo_i, hi_i + 1)}
+        return set()
+    plus = tok.endswith("+")
+    core = tok[:-1] if plus else tok
+    if len(core) == 2 and core[0] == core[1]:              # pair (+)
+        i = _RIDX[core[0]]
+        return {_RANK_ORDER[k] * 2 for k in range(i, 13)} if plus else {core}
+    if len(core) == 3:                                     # suited/offsuit (+)
+        hi, lo, su = core[0], core[1], core[2]
+        if not plus:
+            return {core}
+        return {hi + _RANK_ORDER[k] + su for k in range(_RIDX[lo], _RIDX[hi])}
+    return set()
+
+
+def _expand(spec):
+    out = set()
+    for tok in spec.replace(",", " ").split():
+        out |= _expand_token(tok)
+    return frozenset(out)
+
+
+# --- Range shorthand (deep, >15bb) -----------------------------------------
+# Opens (raise-first-in) by position; BB has no open node.
+_OPEN = {
+    "UTG": "22+, ATs+, KTs+, QTs+, JTs, T9s, 98s, AJo+, KQo",
+    "MP":  "22+, A9s+, KTs+, QTs+, J9s+, T9s, 98s, ATo+, KJo+, QJo",
+    "CO":  "22+, A2s+, K9s+, Q9s+, J8s+, T8s+, 97s+, 86s+, 65s, 54s, A9o+, KTo+, QTo+, JTo",
+    "BTN": "22+, A2s+, K5s+, Q7s+, J7s+, T7s+, 96s+, 85s+, 74s+, 64s+, 53s+, A2o+, K9o+, Q9o+, J9o+, T8o+, 98o",
+    "SB":  "22+, A2s+, K7s+, Q8s+, J8s+, T8s+, 97s+, 86s+, 75s+, 65s, 54s, A7o+, K9o+, Q9o+, JTo",
+}
+# Iso-raise over limpers (tighter than open; multiway).
+_ISO = {
+    "UTG": "77+, ATs+, KQs, AJo+, KQo",
+    "MP":  "77+, ATs+, KQs, AJo+, KQo",
+    "CO":  "55+, A9s+, KTs+, QTs+, JTs, ATo+, KJo+",
+    "BTN": "33+, A8s+, K9s+, Q9s+, J9s+, T9s, A9o+, KJo+",
+    "SB":  "44+, A9s+, KTs+, QTs+, JTs, ATo+, KJo+",
+    "BB":  "44+, A9s+, KTs+, QTs+, JTs, ATo+, KJo+",
+}
+# Facing a single raise: flat (call) and 3-bet ranges by hero position.
+_VS_RAISE_CALL = {
+    "UTG": "TT-22, AQs-ATs, KQs, KJs, QJs, JTs",
+    "MP":  "TT-22, AQs-ATs, KQs, KJs, QJs, JTs, T9s",
+    "CO":  "JJ-22, AJs-A9s, KQs-KTs, QJs-QTs, JTs, T9s, 98s, AQo, KQo",
+    "BTN": "JJ-22, AJs-A8s, KQs-K9s, QJs-Q9s, J9s+, T9s, 98s, 87s, AQo, AJo, KQo",
+    "SB":  "QQ-22, AQs-ATs, KQs-KTs, QJs, JTs",
+    "BB":  "JJ-22, AJs-A2s, KQs-K8s, QJs-Q8s, J8s+, T7s+, 97s+, 86s+, 75s+, 65s, 54s, AQo-ATo, KQo-KTo, QJo, JTo",
+}
+_VS_RAISE_3BET = {
+    "UTG": "QQ+, AKs, AKo, A5s",
+    "MP":  "QQ+, AKs, AKo, A5s, A4s",
+    "CO":  "JJ+, AQs+, AKo, A5s-A4s, KQs",
+    "BTN": "TT+, AQs+, AKo, A5s-A2s, KQs, KJs",
+    "SB":  "QQ+, AKs, AKo, A5s-A3s, KQs",
+    "BB":  "QQ+, AKs, AKo, A5s-A4s, KJs, KQs",
+}
+# Facing a 3-bet (I opened): 4-bet and call. Position-light (one generic each).
+_VS_3BET_4BET = "KK+, AKs, A5s"
+_VS_3BET_CALL = "QQ-TT, AQs, AJs, KQs, AKo"
+# Facing a 4-bet: get-it-in / fold. (Call ~= commit at 100bb.)
+_VS_4BET_CALL = "QQ+, AKs, AKo"
+
+# --- Heads-up (n==2) deep ranges -------------------------------------------
+_HU_SB_OPEN = ("22+, A2s+, A2o+, K2s+, K5o+, Q4s+, Q8o+, J6s+, J9o+, "
+               "T6s+, T9o, 95s+, 85s+, 75s+, 64s+, 54s")
+_HU_BB_3BET = "55+, A8s+, A9o+, KTs+, KJo+, QJs, A5s-A3s"
+_HU_BB_CALL = ("22+, A2s+, A2o+, K2s+, K7o+, Q5s+, Q9o+, J7s+, J9o+, "
+               "T7s+, T9o, 96s+, 86s+, 75s+, 65s, 54s")
+
+# --- Nash-ish push/fold (eff<=15bb). Two tiers: <=10bb and 10-15bb ----------
+_JAM = {
+    "le10": {
+        "UTG": "44+, A8s+, KTs+, QJs, ATo+, KQo",
+        "MP":  "33+, A5s+, A9o+, KTs+, KQo, QJs",
+        "CO":  "22+, A2s+, A7o+, K9s+, KTo+, Q9s+, QJo, J9s+, T9s, 98s",
+        "BTN": "22+, A2s+, A2o+, K5s+, K9o+, Q8s+, QTo+, J8s+, JTo, T8s+, 97s+, 87s",
+        "SB":  "22+, A2s+, A2o+, K6s+, K9o+, Q8s+, QTo+, J8s+, T8s+, 97s+",
+    },
+    "le15": {
+        "UTG": "66+, ATs+, AQo+, KQs",
+        "MP":  "55+, A9s+, AJo+, KQs, KJs",
+        "CO":  "44+, A7s+, ATo+, KJs+, KQo, QJs",
+        "BTN": "22+, A4s+, A8o+, K9s+, KTo+, Q9s+, J9s+, T9s",
+        "SB":  "22+, A4s+, A8o+, K9s+, KTo+, Q9s+, JTs",
+    },
+}
+# Calling an all-in while short (position-light).
+_CALLJAM = {
+    "le10": "44+, A7s+, A9o+, KTs+, KJo+, QJs",
+    "le15": "77+, A9s+, AJo+, KQs",
+}
+# Heads-up short-stack push/fold (very wide).
+_HU_JAM = {
+    "le10": ("22+, A2s+, A2o+, K2s+, K6o+, Q4s+, Q9o+, J7s+, J9o+, "
+             "T7s+, 97s+, 87s, 76s"),
+    "le15": "22+, A2s+, A5o+, K7s+, KTo+, Q9s+, QJo, J9s+, T9s",
+}
+_HU_CALLJAM = {
+    "le10": "22+, A2s+, A2o+, K5s+, K8o+, Q8s+, QTo+, J8s+, T8s+, 97s+",
+    "le15": "44+, A5s+, A8o+, K9s+, KTo+, QTs+, JTs",
+}
+
+
+def _build_charts():
+    """Expand all shorthand into frozensets once, at import time."""
+    def m(d):
+        return {k: _expand(v) for k, v in d.items()}
+    return {
+        "OPEN": m(_OPEN), "ISO": m(_ISO),
+        "VS_RAISE_CALL": m(_VS_RAISE_CALL), "VS_RAISE_3BET": m(_VS_RAISE_3BET),
+        "VS_3BET_4BET": _expand(_VS_3BET_4BET), "VS_3BET_CALL": _expand(_VS_3BET_CALL),
+        "VS_4BET_CALL": _expand(_VS_4BET_CALL),
+        "HU_SB_OPEN": _expand(_HU_SB_OPEN), "HU_BB_3BET": _expand(_HU_BB_3BET),
+        "HU_BB_CALL": _expand(_HU_BB_CALL),
+        "JAM": {t: m(_JAM[t]) for t in _JAM}, "CALLJAM": {t: _expand(_CALLJAM[t]) for t in _CALLJAM},
+        "HU_JAM": {t: _expand(_HU_JAM[t]) for t in _HU_JAM},
+        "HU_CALLJAM": {t: _expand(_HU_CALLJAM[t]) for t in _HU_CALLJAM},
+    }
+
+
+# Optionally load the same tables from data/preflop.json (numpy/json at import
+# only) if a data/ dir was shipped; else use the inline-built charts. Both come
+# from the SAME shorthand via tools/gen_preflop.py, so they're identical by
+# construction — the inline build guarantees the single-file bot always works.
+_CHARTS = _build_charts()
+try:
+    _dd = os.environ.get("BOT_DATA_DIR") or os.path.join(os.path.dirname(__file__), "data")
+    _pf = os.path.join(_dd, "preflop.json")
+    if os.path.isfile(_pf):
+        import json as _json
+        with open(_pf) as _fh:
+            _raw = _json.load(_fh)
+        # Rehydrate nested lists -> frozensets, mirroring _build_charts shape.
+        def _fz(x):
+            if isinstance(x, list):
+                return frozenset(x)
+            return {k: _fz(v) for k, v in x.items()}
+        _CHARTS = _fz(_raw)
+except Exception:
+    pass  # any problem -> keep the inline charts (already built)
+
+
+# --- Preflop situation derivation ------------------------------------------
+
+def _hand_class(cards):
+    """['As','Kh'] -> 'AKo'; ['Ts','Td'] -> 'TT'; high rank first."""
+    hv = _hole_vals(cards)
+    if hv is None:
+        return None
+    hi, lo, is_pair, is_suited = hv
+    rh, rl = _RANK_ORDER[hi - 2], _RANK_ORDER[lo - 2]
+    if is_pair:
+        return rh + rh
+    return rh + rl + ("s" if is_suited else "o")
+
+
+def _pos_label(rel, n):
+    """Seat label from its offset `rel` clockwise from the button (rel 0 = BTN).
+    Fewer players => the first non-blind actor maps to a later (wider) label,
+    which correctly widens ranges short-handed."""
+    if n == 2:
+        return "SB" if rel == 0 else "BB"   # HU: button is the small blind
+    if rel == 0:
+        return "BTN"
+    if rel == 1:
+        return "SB"
+    if rel == 2:
+        return "BB"
+    if rel == n - 1:
+        return "CO"
+    if rel == n - 2:
+        return "MP"
+    return "UTG"
+
+
+def _derive_button(p):
+    """Find the button seat from the posted blinds in action_log."""
+    n = len(p["players"])
+    if n < 2:
+        return None
+    sb = bb = None
+    for a in p["action_log"]:
+        try:
+            if a.get("action") == "small_blind":
+                sb = a.get("seat")
+            elif a.get("action") == "big_blind":
+                bb = a.get("seat")
+        except Exception:
+            continue
+    if n == 2:
+        return sb            # HU: button == small blind
+    if sb is not None:
+        return sb - 1 if sb is not None else None  # button is seat before SB
+    if bb is not None:
+        return bb - 2
+    return None
+
+
+def _position(p):
+    """Return (position_label, n_players) or None if it can't be derived."""
+    n = len(p["players"])
+    btn = _derive_button(p)
+    if btn is None or p["seat"] < 0 or n < 2:
+        return None
+    rel = (p["seat"] - btn) % n
+    return _pos_label(rel, n), n
+
+
+def _facing_preflop(p):
+    """Classify the action in front of us this (preflop) street.
+    Returns (facing_str, n_limpers, facing_all_in)."""
+    raises = 0
+    limps = 0
+    saw_all_in = False
+    for a in p["action_log"]:
+        act = a.get("action")
+        if act in ("small_blind", "big_blind", "fold"):
+            continue
+        if act == "raise":
+            raises += 1
+        elif act == "all_in":
+            raises += 1
+            saw_all_in = True
+        elif act == "call":
+            if raises == 0:
+                limps += 1     # a call before any raise = a limp
+    if raises == 0:
+        return ("vs_limp" if limps > 0 else "unopened"), limps, saw_all_in
+    if raises == 1:
+        return "vs_raise", limps, saw_all_in
+    if raises == 2:
+        return "vs_3bet", limps, saw_all_in
+    return "vs_4bet", limps, saw_all_in
+
+
+def _effective_bb(p):
+    """Effective stack in big blinds: min(my total, biggest live opponent's
+    total) / BB. Drives the push/fold gate."""
+    my_total = p["stack"] + p["bet_this"]
+    opp = []
+    for pl in p["players"]:
+        try:
+            if pl.get("seat") == p["seat"] or pl.get("is_folded"):
+                continue
+            opp.append(int(pl.get("stack", 0)) + int(pl.get("bet_this_street", 0)))
+        except Exception:
+            continue
+    eff = min(my_total, max(opp)) if opp else my_total
+    return eff / float(_BB)
+
+
+# --- Preflop sizing ---------------------------------------------------------
+
+def _open_raise(p, limpers=0):
+    target = max(p["min_raise_to"], int(_BB * 2.5) + limpers * _BB)
+    return _make_raise(p, target)
+
+
+def _threebet_raise(p):
+    return _make_raise(p, max(p["min_raise_to"], p["current_bet"] * 3))
+
+
+def _fourbet_raise(p):
+    return _make_raise(p, max(p["min_raise_to"], int(p["current_bet"] * 2.3)))
+
+
+# --- The chart decision -----------------------------------------------------
+
+def _preflop_chart_action(p):
+    """O(1) chart lookup. Returns a legal action dict, or None to defer to MC."""
+    posn = _position(p)
+    hc = _hand_class(p["your_cards"])
+    if posn is None or hc is None:
+        return None
+    pos, n = posn
+    hu = (n == 2)
+    facing, limpers, facing_jam = _facing_preflop(p)
+    eff = _effective_bb(p)
+
+    # ---- Short stack: Nash-ish push/fold (eff <= 15bb) --------------------
+    if eff <= 15.0:
+        tier = "le10" if eff <= 10.0 else "le15"
+        if facing in ("vs_raise", "vs_3bet", "vs_4bet") and facing_jam:
+            calls = (_CHARTS["HU_CALLJAM"] if hu else _CHARTS["CALLJAM"])[tier]
+            if hc in calls:
+                return _call_or_check(p)
+            return _check_or_fold(p)
+        # Unopened, limped, or facing a non-all-in raise while short -> jam/fold.
+        if hu:
+            jam = _CHARTS["HU_JAM"][tier]
+        else:
+            jam = _CHARTS["JAM"][tier].get(pos, frozenset())
+        if hc in jam:
+            return {"action": "all_in"}
+        return _check_or_fold(p)
+
+    # ---- Deep (>15bb): sized open / call / 3-bet / 4-bet -----------------
+    if facing == "unopened":
+        if hu and pos == "SB":
+            if hc in _CHARTS["HU_SB_OPEN"]:
+                return _open_raise(p)
+            return _check_or_fold(p)
+        rng = _CHARTS["OPEN"].get(pos)
+        if rng is not None and hc in rng:
+            return _open_raise(p)
+        return _check_or_fold(p)
+
+    if facing == "vs_limp":
+        if hc in _CHARTS["ISO"].get(pos, frozenset()):
+            return _open_raise(p, limpers=limpers)
+        return _check_or_fold(p)   # take the free flop (BB) or fold
+
+    if facing == "vs_raise":
+        if hu and pos == "BB":
+            tb, ca = _CHARTS["HU_BB_3BET"], _CHARTS["HU_BB_CALL"]
+        else:
+            tb, ca = _CHARTS["VS_RAISE_3BET"].get(pos, frozenset()), \
+                     _CHARTS["VS_RAISE_CALL"].get(pos, frozenset())
+        if hc in tb:
+            return _threebet_raise(p)
+        if hc in ca:
+            return _call_or_check(p)
+        return _check_or_fold(p)
+
+    if facing == "vs_3bet":
+        if hc in _CHARTS["VS_3BET_4BET"]:
+            return _fourbet_raise(p)
+        if hc in _CHARTS["VS_3BET_CALL"]:
+            return _call_or_check(p)
+        return _check_or_fold(p)
+
+    if facing == "vs_4bet":
+        if hc in _CHARTS["VS_4BET_CALL"]:
+            return _call_or_check(p)
+        return _check_or_fold(p)
+
+    return None
+
+
+# ===========================================================================
 # Pot odds + fallback
 # ===========================================================================
 
@@ -345,7 +723,19 @@ def _strategy_action(p, deadline):
     """Equity vs pot odds. Bet/raise strong equity, call correct-priced draws,
     fold the rest. Deliberately simple — the exploit overlay rides on top later."""
     # Cheap exits that never need MC.
-    if not _HAVE_EVAL7 or len(p["your_cards"]) < 2:
+    if len(p["your_cards"]) < 2:
+        return _fallback_action(p)
+
+    # Phase 3: preflop is an O(1) chart lookup. Covered spots return here with
+    # ~zero compute; uncovered spots (e.g. odd states with no blind info) return
+    # None and fall through to the Monte-Carlo path below. Charts can only add
+    # information, never reduce coverage.
+    if p["street"] == "preflop":
+        chart = _preflop_chart_action(p)
+        if chart is not None:
+            return chart
+
+    if not _HAVE_EVAL7:
         return _fallback_action(p)
     if time.monotonic() >= deadline:
         return _fallback_action(p)

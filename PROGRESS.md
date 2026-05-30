@@ -1,11 +1,10 @@
 # PROGRESS.md — living state (update + commit WITH every phase checkpoint)
 
-- **Last updated:** 2026-05-30 13:42 BST
-- **HEAD:** `4ed130c`  ·  **branch:** `mybot`
-- **NEXT STEP:** Start **Phase 3** — offline `tools/` generator writing precomputed
-  preflop charts (positional open/call/3-bet/4-bet ranges + Nash push/fold);
-  `decide()` does O(1) lookup keyed by (169-hand class, position, facing-action,
-  effective-stack bucket). Replaces the noisy preflop Monte Carlo.
+- **Last updated:** 2026-05-30 14:01 BST
+- **HEAD:** `(this commit)`  ·  **branch:** `mybot`
+- **NEXT STEP:** Start **Phase 4** — postflop: board-texture features, made-hand
+  CLASS + SPR pot control (fixes the one-pair over-commitment leak), c-bet /
+  barrel / check-raise / bluff-catch logic, value/bluff sizing. Keep exploit-ready.
 - **How to resume:** `git checkout mybot` → read this file + `git log --oneline -10`
   → `python3 tools/harness.py` for the current baseline → continue at NEXT STEP.
 
@@ -21,8 +20,8 @@ unprompted. Each phase ends on a runnable, validator-passing checkpoint.
 | 0 — Recon / ground truth | ✅ DONE | (captured in this file + memory) |
 | 1 — Safe skeleton | ✅ DONE | `529c568` |
 | 2 — Equity core (MC, eval7) | ✅ DONE | `2eb1b55`; tooling `1a9e319`; repro harness `4ed130c` |
-| 3 — Preflop as precomputed data | ⏳ NEXT | — |
-| 4 — Postflop (texture, SPR, pot control) | ◻ TODO | — |
+| 3 — Preflop as precomputed charts | ✅ DONE | `(this commit)` |
+| 4 — Postflop (texture, SPR, pot control) | ⏳ NEXT | — |
 | 5 — Opponent modelling + exploitation | ◻ TODO (HARD-STOP before) | — |
 | 6 — Test harness + tuning + regression gate | ◻ TODO | — |
 | 7 — Package + validate + BOT_README | ◻ TODO | — |
@@ -81,9 +80,21 @@ unprompted. Each phase ends on a runnable, validator-passing checkpoint.
   + SPR pot control), NOT blanket call-bar tightening (measured −EV).
 - **vs-random equity is optimistic** against value-heavy ranges → over-calls vs
   tight opponents. Fix via range modelling (Phase 4) + per-opponent reads (Phase 5).
-- **Preflop currently uses noisy MC** → Phase 3 replaces with O(1) chart lookup.
+- ~~Preflop noisy MC~~ → **RESOLVED Phase 3**: O(1) chart lookup (position ×
+  facing × stack bucket); push/fold gated at eff ≤ 15bb (100bb never shoves);
+  HU ranges for the endgame. Uncovered spots still fall back to MC.
+
+## Phase 3 notes (preflop charts)
+- Charts are compact shorthand in `bot.py`, expanded to frozensets at import
+  (`_build_charts`). `tools/gen_preflop.py` writes the same tables to
+  `bots/mybot/data/preflop.json` (json artifact for the optional zip); bot.py
+  prefers data/ json if shipped, else identical inline build → no drift.
+- Position derived from posted blinds in `action_log`; facing from raise count;
+  effective bb = min(my total, biggest live opp total)/100.
+- Single-file submission unaffected (inline charts; data/ optional).
 
 ## Current performance (baseline to beat)
-vs reproducible 5-bot field, 30 seeds: mean **+13.7k**, 27/30 table wins, 1 bust.
-vs live (stochastic) field: mean +11.8k, 24/30 wins, 4 busts. Validator: PASSED.
-Worst-case `decide()` ~4 ms full speed (~8 ms @ 0.5 core); budget guard caps at 1.2 s.
+A/B (40 seeds, seeded refs, common random numbers):
+- **Phase 3 charts: mean +16.3k, 33/40 table-wins, 6 busts** (paired +4.8k vs Phase 2).
+- Phase 2 (pre-charts): mean +11.5k, 32/40 wins, 5 busts. 0 bot_errors.
+Validator: PASSED. Worst-case `decide()` ~4 ms (~8 ms @ 0.5 core); guard caps 1.2 s.
