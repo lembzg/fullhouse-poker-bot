@@ -1,7 +1,7 @@
 # PROGRESS.md — living state (update + commit WITH every phase checkpoint)
 
 - **Last updated:** 2026-05-30 14:01 BST
-- **HEAD:** `(this commit)`  ·  **branch:** `mybot`
+- **HEAD:** `44b72c8`  ·  **branch:** `mybot`
 - **NEXT STEP:** Start **Phase 4** — postflop: board-texture features, made-hand
   CLASS + SPR pot control (fixes the one-pair over-commitment leak), c-bet /
   barrel / check-raise / bluff-catch logic, value/bluff sizing. Keep exploit-ready.
@@ -20,7 +20,7 @@ unprompted. Each phase ends on a runnable, validator-passing checkpoint.
 | 0 — Recon / ground truth | ✅ DONE | (captured in this file + memory) |
 | 1 — Safe skeleton | ✅ DONE | `529c568` |
 | 2 — Equity core (MC, eval7) | ✅ DONE | `2eb1b55`; tooling `1a9e319`; repro harness `4ed130c` |
-| 3 — Preflop as precomputed charts | ✅ DONE | `(this commit)` |
+| 3 — Preflop as precomputed charts | ✅ DONE | `44b72c8` |
 | 4 — Postflop (texture, SPR, pot control) | ⏳ NEXT | — |
 | 5 — Opponent modelling + exploitation | ◻ TODO (HARD-STOP before) | — |
 | 6 — Test harness + tuning + regression gate | ◻ TODO | — |
