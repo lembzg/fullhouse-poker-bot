@@ -4,12 +4,14 @@
  No-Limit Texas Hold'em, 6-max (handles 2-9 as tables shrink to heads-up)
 ================================================================================
 
-PHASE 2 — EQUITY CORE.
-Replaces Phase 1's crude hand-tier proxy with a real Monte-Carlo equity engine
-built on eval7 (the engine's own evaluator). Decisions now compare estimated
-equity against pot odds / required equity. Preflop charts (Phase 3), board
-texture & bet-sizing nuance (Phase 4), and opponent modelling (Phase 5) build on
-top of this.
+PHASES 2–4a.
+Phase 2 built a Monte-Carlo equity core on eval7 (the engine's own evaluator);
+Phase 3 made preflop an O(1) chart lookup. Phase 4a adds POSTFLOP made-hand
+CLASS + STACK-TO-POT-RATIO pot control on top of the equity number: the class
+governs how much we're willing to commit (one pair never stacks off when deep —
+the K7o over-commitment leak), equity governs whether the immediate price is
+right. C-bet / barrel / bluff-catch refinement and opponent modelling build on
+top later (Phases 4b / 5).
 
 ALL Phase-1 safety guarantees are preserved:
   - guaranteed-legal pot-odds FALLBACK computed first, before any MC work;
@@ -704,6 +706,17 @@ _VALUE_BET_EQ   = 0.58   # when checked to, bet for value at/above this equity
 _VALUE_RAISE_EQ = 0.78   # when facing a bet, raise (not just call) at/above this
 _CALL_CUSHION   = 0.03   # require equity >= pot_odds + this to call
 
+# --- Phase 4a: postflop SPR pot control (one-pair over-commitment guard) ----
+# Effective stack-to-pot ratio governs commitment. Low SPR = already pot-
+# committed (call off fine); high SPR = deep, so a lone weak pair must NOT stack
+# off — vs-random equity over-rates one pair facing raise-over-raise (the K7o
+# leak). This caps only how DEEP we go with one pair; it does NOT widen our
+# folds to a single bet (the field over-bluffs, so bluff-catching stays +EV;
+# blanket tightening measured -EV in Phase 2).
+_SPR_COMMIT    = 1.5    # SPR at/below this = committed; a lone weak pair may call off
+_STACKOFF_FRAC = 0.6    # a call >= this fraction of remaining stack ~= stacking off
+_STACKOFF_EQ   = 0.85   # only commit a lone weak pair for stacks at/above this equity
+
 
 def _preflop_raise_target(p):
     """Open / re-raise sizing preflop: ~3x the current bet (a standard ~3bb open
@@ -717,6 +730,93 @@ def _bet_target(p, pot_frac):
     bet (so checked-to => bet pot_frac*pot; facing a bet => raise by pot_frac*pot)."""
     add = max(p["min_raise_to"] - p["current_bet"], int(p["pot"] * pot_frac))
     return p["current_bet"] + add
+
+
+def _spr(p):
+    """Effective stack-to-pot ratio. Uses REMAINING stacks (min of mine and the
+    largest live opponent's) over the current pot. Low => committed; high =>
+    deep. Returns a large number when the pot is empty (pre-betting)."""
+    pot = p["pot"]
+    if pot <= 0:
+        return 999.0
+    opp = []
+    for pl in p["players"]:
+        try:
+            if pl.get("seat") == p["seat"] or pl.get("is_folded"):
+                continue
+            opp.append(int(pl.get("stack", 0)))
+        except Exception:
+            continue
+    eff = min(p["stack"], max(opp)) if opp else p["stack"]
+    return eff / float(pot)
+
+
+def _pair_class(cards, board):
+    """Refine a one-pair hand into a commitment tier. MEDIUM = overpair or
+    top-pair-good-kicker (fine to play for stacks at low SPR); MARGINAL =
+    anything weaker — 2nd pair, under/weak pair, top-pair-weak-kicker — which
+    must pot-control. Falls back to MARGINAL on any ambiguity (safe: caps us)."""
+    r0, r1 = _RANK_VAL.get(cards[0][0]), _RANK_VAL.get(cards[1][0])
+    bvals = [_RANK_VAL.get(c[0]) for c in board]
+    bvals = [b for b in bvals if b is not None]
+    if r0 is None or r1 is None or not bvals:
+        return "MARGINAL"
+    top_board = max(bvals)
+    if r0 == r1:                                  # pocket pair: over- or under-pair
+        return "MEDIUM" if r0 > top_board else "MARGINAL"
+    hi, lo = max(r0, r1), min(r0, r1)
+    paired = [r for r in (r0, r1) if r in bvals]  # which hole rank hit the board
+    if not paired:
+        return "MARGINAL"                         # only the board is paired -> weak
+    pr = max(paired)
+    kicker = hi if pr != hi else lo               # the unpaired hole card
+    higher = len({b for b in bvals if b > pr})    # distinct board ranks beating ours
+    if higher == 0:                               # top pair
+        return "MEDIUM" if kicker >= _RANK_VAL["J"] else "MARGINAL"
+    return "MARGINAL"                             # 2nd pair or worse
+
+
+def _made_hand_class(p):
+    """Postflop made-hand class: STRONG (two pair+), MEDIUM / MARGINAL (one
+    pair, refined by _pair_class), or WEAK (high card). Returns None when it
+    can't be computed (no eval7, malformed cards, <3 board) so the caller
+    defers to the pure equity logic — class can only add information."""
+    cards, board = p["your_cards"], p["community"]
+    if not _HAVE_EVAL7 or len(cards) < 2 or len(board) < 3:
+        return None
+    try:
+        ev = [_CARD_BY_STR[c] for c in cards] + [_CARD_BY_STR[c] for c in board]
+    except KeyError:
+        return None
+    ht = eval7.handtype(eval7.evaluate(ev))
+    if ht == "High Card":
+        return "WEAK"
+    if ht == "Pair":
+        return _pair_class(cards, board)
+    return "STRONG"   # Two Pair, Trips, Straight, Flush, Full House, Quads, SF
+
+
+def _postflop_overcommit_guard(p, eq):
+    """SUBTRACTIVE pot-control guard for the one-pair over-commitment leak.
+
+    Returns a SAFER action ONLY when the baseline equity logic would commit a
+    lone weak pair too deep (the K7o leak: vs-random equity over-rates one pair
+    facing raise-over-raise); otherwise returns None to keep baseline behavior
+    untouched. It can only downgrade raise->call or call-off->fold — it NEVER
+    adds a bet/raise baseline wouldn't make, so it cannot increase our variance
+    or create new stack-offs. Value-betting / bluff-catching the over-folding,
+    over-bluffing field is left fully intact (blanket tightening measured -EV)."""
+    if _made_hand_class(p) != "MARGINAL":
+        return None                         # only lone weak pairs are capped
+    if p["can_check"]:
+        return None                         # no bet to us -> baseline value-bets
+    # Facing a bet with a lone weak pair.
+    overcommit = p["owed"] >= _STACKOFF_FRAC * max(1, p["stack"])
+    if overcommit and _spr(p) > _SPR_COMMIT and eq < _STACKOFF_EQ:
+        return {"action": "fold"}           # don't stack off one pair when deep
+    if eq >= _VALUE_RAISE_EQ:
+        return _call_or_check(p)            # don't value-RAISE one pair into aggression
+    return None                             # else: baseline (call if priced, else fold)
 
 
 def _strategy_action(p, deadline):
@@ -745,6 +845,14 @@ def _strategy_action(p, deadline):
     eq = monte_carlo_equity(p["your_cards"], p["community"],
                             [None] * n_opp, iters, deadline)
     req = _required_equity(p)
+
+    # Phase 4a: a subtractive pot-control guard intercepts ONLY the one-pair
+    # over-commitment leak; everything else falls through to the baseline equity
+    # logic below (which also serves preflop spots the charts didn't cover).
+    if p["street"] != "preflop":
+        guard = _postflop_overcommit_guard(p, eq)
+        if guard is not None:
+            return guard
 
     if p["can_check"]:
         # No bet to us: value-bet strong equity, otherwise take the free card.

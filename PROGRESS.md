@@ -1,10 +1,11 @@
 # PROGRESS.md — living state (update + commit WITH every phase checkpoint)
 
-- **Last updated:** 2026-05-30 14:01 BST
-- **HEAD:** `44b72c8`  ·  **branch:** `mybot`
-- **NEXT STEP:** Start **Phase 4** — postflop: board-texture features, made-hand
-  CLASS + SPR pot control (fixes the one-pair over-commitment leak), c-bet /
-  barrel / check-raise / bluff-catch logic, value/bluff sizing. Keep exploit-ready.
+- **Last updated:** 2026-05-30 21:33 BST
+- **HEAD:** `7556ee5` (Phase 4a checkpoint)  ·  **branch:** `mybot`
+- **NEXT STEP:** **Phase 4b** — postflop board-texture features + c-bet / barrel /
+  check-raise / bluff-catch logic + value/bluff sizing (one-pair pot growth when
+  checked to is currently deferred to baseline; tighten sizing here). Phase 4a
+  (made-hand CLASS + SPR over-commitment guard) is DONE. Keep exploit-ready.
 - **How to resume:** `git checkout mybot` → read this file + `git log --oneline -10`
   → `python3 tools/harness.py` for the current baseline → continue at NEXT STEP.
 
@@ -20,8 +21,8 @@ unprompted. Each phase ends on a runnable, validator-passing checkpoint.
 | 0 — Recon / ground truth | ✅ DONE | (captured in this file + memory) |
 | 1 — Safe skeleton | ✅ DONE | `529c568` |
 | 2 — Equity core (MC, eval7) | ✅ DONE | `2eb1b55`; tooling `1a9e319`; repro harness `4ed130c` |
-| 3 — Preflop as precomputed charts | ✅ DONE | `44b72c8` |
-| 4 — Postflop (texture, SPR, pot control) | ⏳ NEXT | — |
+| 3 — Preflop as precomputed charts | ✅ DONE | `44b72c8` (docs `370bc33`) |
+| 4 — Postflop (texture, SPR, pot control) | 🟡 4a DONE / 4b NEXT | 4a: `7556ee5` |
 | 5 — Opponent modelling + exploitation | ◻ TODO (HARD-STOP before) | — |
 | 6 — Test harness + tuning + regression gate | ◻ TODO | — |
 | 7 — Package + validate + BOT_README | ◻ TODO | — |
@@ -74,10 +75,14 @@ unprompted. Each phase ends on a runnable, validator-passing checkpoint.
   bets). Field over-folds / under-raises → exploitation thesis holds.
 
 ## Known leaks (to fix in later phases)
-- **One-pair over-commitment vs escalating aggression** — stacked off 100 bb with
-  2nd pair (K7o) vs a re-raising opponent who had top pair. Raw equity-vs-random
-  overvalues one pair facing raise-over-raise. **Fix in Phase 4** (made-hand class
-  + SPR pot control), NOT blanket call-bar tightening (measured −EV).
+- ~~**One-pair over-commitment vs escalating aggression**~~ — stacked off 100 bb
+  with 2nd pair (K7o) vs a re-raising opponent who had top pair. **GUARDED in
+  Phase 4a**: `_postflop_overcommit_guard` is a *strictly subtractive* SPR cap —
+  a lone weak pair (MARGINAL class) facing a bet folds the stack-off when deep
+  (SPR>1.5, call ≥60 % of stack, eq<0.85) and never value-raises into aggression.
+  Can only downgrade raise→call / call-off→fold, so it provably can't bust more
+  than baseline (verified: 0 new busts in the 30-seed A/B). NOT blanket call-bar
+  tightening (measured −EV). Full postflop sizing/pot-growth control → Phase 4b.
 - **vs-random equity is optimistic** against value-heavy ranges → over-calls vs
   tight opponents. Fix via range modelling (Phase 4) + per-opponent reads (Phase 5).
 - ~~Preflop noisy MC~~ → **RESOLVED Phase 3**: O(1) chart lookup (position ×
@@ -93,8 +98,31 @@ unprompted. Each phase ends on a runnable, validator-passing checkpoint.
   effective bb = min(my total, biggest live opp total)/100.
 - Single-file submission unaffected (inline charts; data/ optional).
 
+## Phase 4a notes (made-hand class + SPR over-commitment guard)
+- New postflop helpers in `bot.py`: `_spr` (effective stack-to-pot from remaining
+  stacks), `_pair_class` (overpair/TPGK → MEDIUM; 2nd pair / weak-kicker TP /
+  under-pair → MARGINAL; ambiguity → MARGINAL = safe), `_made_hand_class` (O(1)
+  via `eval7.handtype`: two pair+ → STRONG, one pair → MEDIUM/MARGINAL, high card
+  → WEAK; returns None → defer to pure equity), `_postflop_overcommit_guard`.
+- **Design lesson:** the first attempt was a full postflop *rewrite* (class-sized
+  value bets + MEDIUM/STRONG value-raises). It was *additive* (raised more) and
+  created 3 NEW busts (−4.8k mean, busts 5→8). Rebuilt as a *strictly subtractive*
+  guard that can only reduce commitment → provably can't regress. Rule for Phase
+  4b: a leak fix must never add a bet/raise the baseline wouldn't make.
+- Constants: `_SPR_COMMIT=1.5`, `_STACKOFF_FRAC=0.6`, `_STACKOFF_EQ=0.85`
+  (principled defaults; grid-tune in Phase 6, per standing decision).
+- Guard fires rarely vs the 5 over-bluffing refs (1/30 seeds) — folding one pair
+  ≈ break-even against bluff-heavy opponents. It is *insurance* against the
+  catastrophic deep stack-off that matters vs the stronger 500-bot field, not an
+  EV boost vs these refs.
+
 ## Current performance (baseline to beat)
-A/B (40 seeds, seeded refs, common random numbers):
-- **Phase 3 charts: mean +16.3k, 33/40 table-wins, 6 busts** (paired +4.8k vs Phase 2).
+Deterministic 30-seed A/B (harness.py: seeded refs + `BOT_RNG_SEED`, common
+random numbers), paired vs the previous checkpoint:
+- **Phase 4a: mean +16,804, 24/30 table-wins, 5 busts** (paired +50 vs Phase 3;
+  the 1 seed the guard touched improved +45.9k→+47.4k; 0 new busts).
+- Phase 3 charts: mean +16,754 (this harness) / +16.3k (earlier 40-seed run),
+  24/30 wins, 5 busts.
 - Phase 2 (pre-charts): mean +11.5k, 32/40 wins, 5 busts. 0 bot_errors.
-Validator: PASSED. Worst-case `decide()` ~4 ms (~8 ms @ 0.5 core); guard caps 1.2 s.
+Validator: PASSED. Equity: 5/5. Worst-case `decide()` ~4 ms (~8 ms @ 0.5 core);
+guard caps 1.2 s. Determinism: `harness.py --check` = YES.
