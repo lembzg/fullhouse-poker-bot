@@ -115,6 +115,7 @@ def _parse(state):
     p["players"]       = list(_g(state, "players", []))
     p["seat"]          = int(_g(state, "seat_to_act", -1))
     p["action_log"]    = list(_g(state, "action_log", []))
+    p["match_log"]     = list(_g(state, "match_action_log", []))  # Phase 5: opp model
     p["max_to"]        = p["bet_this"] + p["stack"]
     return p
 
@@ -725,6 +726,33 @@ _STACKOFF_EQ   = 0.85   # only commit a lone weak pair for stacks at/above this 
 _SIZE_DRY      = 0.45   # bet/raise as a fraction of pot, added on top, on dry boards
 _SIZE_WET      = 0.70   # bet/raise fraction on wet boards
 
+# --- Phase 5: opponent modelling + exploitation ----------------------------
+# Per-opponent behavioural stats accumulated across the match (module globals
+# persist the whole match; the next match is a fresh process, so they reset).
+# Keyed by stable bot_id (seat is NOT stable). Built ONLY from
+# state["match_action_log"] (every bot's voluntary actions, bot_id-tagged) via
+# street-AGNOSTIC heuristics: "first action in the hand" (= the preflop entry)
+# and "facing prior aggression" — that log has no street markers or blinds, and
+# the bot never receives showdown cards, so no card-based reads are possible.
+# Exploits MODULATE the committed 4a/4b engine (thresholds / sizes / bluff-enable)
+# and NEVER bypass the 4a over-commitment guard. Two independent switches so each
+# tier can ship on its own evidence bar (G4): the conditional engine on a
+# neutral-or-better bar; the re-enabled 4b bluff layer only on a strict positive.
+_ENABLE_EXPLOIT       = True    # classification + value / bluff-catch deviations
+_ENABLE_EXPLOIT_BLUFF = True    # gated 4b bluff layer ON (Phase 5 A/B: +560, p=0.026)
+
+_SHRINK_K = 20.0    # pseudo-actions: shrink each opp rate toward the live prior
+_POOL_K   = 200.0   # pseudo-actions before the running field pool is trusted
+_MIN_OBS  = 12      # below this many actions an opponent is 'unknown' -> baseline
+
+# Fixed Phase-0 prior (loose-passive / over-folding field). The LIVE prior blends
+# from this toward the running pooled field average as the pool grows (G2 hybrid).
+_FIXED_PRIOR = {"vpip": 0.45, "pfr": 0.18, "aggr": 0.30, "f2b": 0.45, "f23": 0.40}
+
+_OPP = {}        # bot_id -> count record (see _fold_entry)
+_OPP_HANDS = {}  # hand_num -> transient in-hand attribution state
+_OPP_DONE = {}   # hand_num -> count of match_action_log entries already folded in
+
 
 def _preflop_raise_target(p):
     """Open / re-raise sizing preflop: ~3x the current bet (a standard ~3bb open
@@ -864,60 +892,392 @@ def _board_texture(board):
             "straighty": straighty, "paired": len(rvals) != len(set(rvals))}
 
 
+# --- Opponent model: observation -------------------------------------------
+
+def _fold_entry(hn, e):
+    """Fold one match_action_log entry into the per-bot counters. Uses per-hand
+    transient state (`_OPP_HANDS[hn]`) so 'first action' / 'facing aggression' /
+    'opener faced a 3-bet' are attributed correctly as entries stream in."""
+    b, a = e.get("bot_id"), e.get("action")
+    if b is None or a is None:
+        return
+    rec = _OPP.get(b)
+    if rec is None:
+        rec = _OPP[b] = {"n": 0, "hands": 0, "vpip": 0, "pfr": 0, "aggr": 0,
+                         "passive": 0, "fold": 0, "faced": 0, "foldfaced": 0,
+                         "opened": 0, "faced3": 0, "fold3": 0}
+    hs = _OPP_HANDS.get(hn)
+    if hs is None:
+        hs = _OPP_HANDS[hn] = {"acted": set(), "aggr_yet": False,
+                               "opener": None, "reraised": False}
+    first = b not in hs["acted"]
+    if first:
+        hs["acted"].add(b)
+        rec["hands"] += 1
+        if a in ("call", "raise", "all_in"):
+            rec["vpip"] += 1                 # first action put money in = VPIP
+        if a in ("raise", "all_in"):
+            rec["pfr"] += 1                  # first action was a raise = PFR
+    rec["n"] += 1
+    aggressive = a in ("raise", "all_in")
+    if aggressive:
+        rec["aggr"] += 1
+    elif a in ("call", "check"):
+        rec["passive"] += 1
+    elif a == "fold":
+        rec["fold"] += 1
+    if hs["aggr_yet"]:                        # responding to prior aggression
+        rec["faced"] += 1
+        if a == "fold":
+            rec["foldfaced"] += 1
+    if b == hs["opener"] and hs["reraised"] and not first:   # opener faces a 3-bet+
+        rec["faced3"] += 1
+        if a == "fold":
+            rec["fold3"] += 1
+        hs["reraised"] = False
+    if aggressive:                           # update aggression state AFTER attribution
+        if hs["aggr_yet"]:
+            hs["reraised"] = True            # a re-raise over the opener
+        else:
+            hs["opener"] = b
+            rec["opened"] += 1
+            hs["aggr_yet"] = True
+
+
+def _observe(p):
+    """Best-effort: fold any new match_action_log entries into the opponent
+    model. Per-hand done-counts de-dup; because we act far more often than every
+    200 actions, the rolling-200 window never drops an unprocessed entry."""
+    if not _ENABLE_EXPLOIT:
+        return
+    log = p.get("match_log") or []
+    if not log:
+        return
+    counts = {}
+    min_hn = None
+    for e in log:
+        hn = e.get("hand_num")
+        if hn is None:
+            continue
+        if min_hn is None or hn < min_hn:
+            min_hn = hn
+        idx = counts.get(hn, 0)
+        counts[hn] = idx + 1
+        if idx < _OPP_DONE.get(hn, 0):
+            continue                          # already folded in
+        _fold_entry(hn, e)
+        _OPP_DONE[hn] = idx + 1
+    if min_hn is not None:                    # prune transient state for old hands
+        for d in (_OPP_HANDS, _OPP_DONE):
+            for k in [k for k in d if k < min_hn]:
+                del d[k]
+
+
+# --- Opponent model: prior, shrinkage, classification ----------------------
+
+def _live_prior():
+    """Hybrid prior (G2): fixed Phase-0 prior blended toward the running pooled
+    field average as the pool grows (pool confidence = pool_n/(pool_n+_POOL_K))."""
+    tot = {"hands": 0, "vpip": 0, "pfr": 0, "aggr": 0, "passive": 0,
+           "faced": 0, "foldfaced": 0, "n": 0}
+    for r in _OPP.values():
+        for k in tot:
+            tot[k] += r.get(k, 0)
+    if tot["n"] <= 0:
+        return _FIXED_PRIOR
+    ap = tot["aggr"] + tot["passive"]
+    pooled = {
+        "vpip": tot["vpip"] / tot["hands"] if tot["hands"] else _FIXED_PRIOR["vpip"],
+        "pfr":  tot["pfr"] / tot["hands"] if tot["hands"] else _FIXED_PRIOR["pfr"],
+        "aggr": tot["aggr"] / ap if ap else _FIXED_PRIOR["aggr"],
+        "f2b":  tot["foldfaced"] / tot["faced"] if tot["faced"] else _FIXED_PRIOR["f2b"],
+        "f23":  _FIXED_PRIOR["f23"],          # pooled 3-bet sample too sparse; keep fixed
+    }
+    cp = tot["n"] / (tot["n"] + _POOL_K)
+    return {k: cp * pooled[k] + (1.0 - cp) * _FIXED_PRIOR[k] for k in _FIXED_PRIOR}
+
+
+def _opp_rates(b):
+    """Shrinkage-smoothed rates for one bot_id (each rate shrunk toward the live
+    prior by its own denominator + _SHRINK_K). `conf` scales exploit magnitude."""
+    rec = _OPP.get(b)
+    if not rec:
+        return None
+    pr = _live_prior()
+
+    def sh(num, den, key):
+        return (num + _SHRINK_K * pr[key]) / (den + _SHRINK_K)
+
+    return {
+        "n":    rec["n"],
+        "vpip": sh(rec["vpip"], rec["hands"], "vpip"),
+        "pfr":  sh(rec["pfr"], rec["hands"], "pfr"),
+        "aggr": sh(rec["aggr"], rec["aggr"] + rec["passive"], "aggr"),
+        "f2b":  sh(rec["foldfaced"], rec["faced"], "f2b"),
+        "f23":  sh(rec["fold3"], rec["faced3"], "f23"),
+        "conf": rec["n"] / (rec["n"] + _SHRINK_K),
+    }
+
+
+def _classify(b):
+    """(type, confidence). 'unknown' below _MIN_OBS actions or when no bucket
+    fits -> the caller then plays pure baseline."""
+    r = _opp_rates(b)
+    if not r or r["n"] < _MIN_OBS:
+        return ("unknown", 0.0)
+    v, a, f = r["vpip"], r["aggr"], r["f2b"]
+    if a > 0.55 and v > 0.50:
+        t = "maniac"
+    elif v > 0.50 and a < 0.25 and f < 0.35:
+        t = "station"
+    elif v < 0.25 and f > 0.55:
+        t = "nit"
+    elif 0.25 <= v <= 0.50 and 0.30 <= a <= 0.55:
+        t = "tag"
+    else:
+        t = "unknown"
+    return (t, r["conf"])
+
+
+# --- Opponent model: identity resolution + exploit context -----------------
+
+def _seat_to_bot(p):
+    m = {}
+    for pl in p["players"]:
+        try:
+            m[pl.get("seat")] = pl.get("bot_id")
+        except Exception:
+            continue
+    return m
+
+
+def _last_aggressor_seat(p):
+    """Seat of the last raise/all_in this hand = the player whose bet we face."""
+    seat = None
+    for a in p["action_log"]:
+        try:
+            if a.get("action") in ("raise", "all_in"):
+                seat = a.get("seat")
+        except Exception:
+            continue
+    return seat
+
+
+def _bettor_type(p):
+    seat = _last_aggressor_seat(p)
+    if seat is None:
+        return ("unknown", 0.0)
+    bid = _seat_to_bot(p).get(seat)
+    return _classify(bid) if bid is not None else ("unknown", 0.0)
+
+
+def _live_opp_bots(p):
+    out = []
+    for pl in p["players"]:
+        try:
+            if pl.get("seat") == p["seat"] or pl.get("is_folded"):
+                continue
+            b = pl.get("bot_id")
+            if b is not None:
+                out.append(b)
+        except Exception:
+            continue
+    return out
+
+
+def _dominant_value_type(p):
+    """Most exploitable live opponent for value purposes (station > nit > maniac
+    > tag/unknown) — who is likely to call/pay a value bet when we're checked to."""
+    rank = {"station": 3, "nit": 2, "maniac": 1, "tag": 0, "unknown": -1}
+    best = ("unknown", 0.0)
+    for b in _live_opp_bots(p):
+        t, c = _classify(b)
+        if rank.get(t, -1) > rank.get(best[0], -1):
+            best = (t, c)
+    return best
+
+
+def _all_opps_foldy(p):
+    """Bluff gate: every live opponent over-folds (nit, or high fold-to-bet with
+    a real sample) AND none is a station or maniac. 'C-bet the folders, never
+    the aggressor.'"""
+    bots = _live_opp_bots(p)
+    if not bots:
+        return False
+    for b in bots:
+        t, _ = _classify(b)
+        if t in ("station", "maniac"):
+            return False
+        r = _opp_rates(b)
+        foldy = (t == "nit") or (r is not None and r["n"] >= _MIN_OBS and r["f2b"] > 0.55)
+        if not foldy:
+            return False
+    return True
+
+
+def _exploit_adjust(p):
+    """Confidence-scaled deltas applied to the postflop value/bluff-catch
+    thresholds and sizing, plus the bluff-enable gate. All zero (== baseline)
+    when exploitation is off, the opponent is unknown/tag, or anything throws."""
+    z = {"val_eq": 0.0, "raise_eq": 0.0, "size": 0.0, "bcatch": 0.0, "allow_bluff": False}
+    if not _ENABLE_EXPLOIT:
+        return z
+    try:
+        if not p["can_check"]:
+            t, conf = _bettor_type(p)          # facing a bet -> the bettor's profile
+        else:
+            t, conf = _dominant_value_type(p)  # value-betting -> who will call
+        if t == "station":                     # pays off: bet thinner & bigger; don't bluff-catch their raises
+            z["val_eq"] = -0.06 * conf; z["raise_eq"] = -0.05 * conf
+            z["size"] = 0.12 * conf; z["bcatch"] = 0.10 * conf
+        elif t == "maniac":                    # bets are air: widen bluff-catch
+            z["bcatch"] = -0.08 * conf
+        elif t == "nit":                       # over-folds, bets are nutted: smaller value, overfold their bets
+            z["bcatch"] = 0.12 * conf; z["size"] = -0.05 * conf; z["val_eq"] = 0.04 * conf
+        # tag / unknown -> zeros (straightforward baseline)
+        if _ENABLE_EXPLOIT_BLUFF and _all_opps_foldy(p):
+            z["allow_bluff"] = True
+    except Exception:
+        return {"val_eq": 0.0, "raise_eq": 0.0, "size": 0.0, "bcatch": 0.0, "allow_bluff": False}
+    return z
+
+
+# --- Gated bluff layer (re-enabled from Phase 4b, behind the opponent gate) --
+
+def _hero_draw(cards, board):
+    """Hero's strongest draw: 'flush_draw' (4 to a flush, hero holds one), 'oesd'
+    (>=2 straight-completing ranks), 'gutshot' (1), or None (incl. on the river)."""
+    if len(board) >= 5 or len(cards) < 2:
+        return None
+    hero_suit, all_suit = {}, {}
+    for c in cards:
+        if len(c) >= 2:
+            hero_suit[c[1]] = hero_suit.get(c[1], 0) + 1
+    for c in cards + board:
+        if len(c) >= 2:
+            all_suit[c[1]] = all_suit.get(c[1], 0) + 1
+    if any(all_suit[s] == 4 and hero_suit.get(s, 0) >= 1 for s in all_suit):
+        return "flush_draw"
+    vals = set()
+    for c in cards + board:
+        v = _RANK_VAL.get(c[0]) if len(c) >= 2 else None
+        if v is not None:
+            vals.add(v)
+            if v == 14:
+                vals.add(1)
+    completing = 0
+    for need in range(1, 15):
+        if need in vals:
+            continue
+        t = vals | {need}
+        if any(all((lo + k) in t for k in range(5)) for lo in range(1, 11)):
+            completing += 1
+    if completing >= 2:
+        return "oesd"
+    if completing == 1:
+        return "gutshot"
+    return None
+
+
+def _has_betting_lead(p):
+    """Hero was the last aggressor this hand (range advantage / c-bet spot)."""
+    return _last_aggressor_seat(p) == p["seat"]
+
+
+def _is_allin_size(p, pot_frac):
+    """True if a bet/raise of this pot fraction would commit our whole stack — so
+    we never SHOVE a bluff/semibluff (only value/committed spots go all in)."""
+    return _bet_target(p, pot_frac) >= p["max_to"]
+
+
+def _bluff_when_checked(p, wet, size):
+    """Checked to us with no made-hand value: semibluff a real draw; else c-bet
+    air with the lead on a dry flop/turn. Only reached when the gate is open."""
+    draw = _hero_draw(p["your_cards"], p["community"])
+    if draw in ("flush_draw", "oesd") and not _is_allin_size(p, size):
+        return _make_raise(p, _bet_target(p, size))              # semibluff
+    if len(p["community"]) < 5 and not wet and _has_betting_lead(p) \
+            and not _is_allin_size(p, _SIZE_DRY):
+        return _make_raise(p, _bet_target(p, _SIZE_DRY))         # range-advantage c-bet
+    return None
+
+
+def _bluff_when_facing(p, wet, size):
+    """Facing a bet with no made hand: semibluff-RAISE (check-raise) a real draw
+    on flop/turn when it won't shove. Only reached when the gate is open."""
+    draw = _hero_draw(p["your_cards"], p["community"])
+    if draw in ("flush_draw", "oesd") and len(p["community"]) < 5 \
+            and not _is_allin_size(p, size):
+        return _make_raise(p, _bet_target(p, size))
+    return None
+
+
 def _postflop_strategy(p, eq):
-    """Phase 4b postflop layer: class- and texture-aware VALUE betting with
-    polarized (dry-small, wet-large) sizing, plus bluff-catching priced by
-    texture + SPR. Runs AFTER the Phase 4a over-commitment guard, so the
-    dangerous one-pair stack-offs are already handled and cannot reach here.
-    Returns None only for unclassifiable hands -> defers to baseline equity.
-    (Bluff/semibluff initiative is intentionally absent -> deferred to the
-    opponent-conditional Phase 5; see the section header.)"""
+    """Phase 4b value / bluff-catch layer, MODULATED by the Phase 5 opponent
+    model: value thresholds & sizing and the bluff-catch bar shift by the
+    relevant opponent's type (confidence-scaled), and the deferred 4b bluff layer
+    is re-enabled only when the gate is open (all live opponents foldy, none a
+    station/maniac). Runs AFTER the Phase 4a over-commitment guard, which it never
+    bypasses. Returns None for unclassifiable hands -> baseline equity. With
+    exploitation off or opponents unknown every delta is 0 and no bluff fires, so
+    this is byte-identical to the committed Phase 4b."""
     klass = _made_hand_class(p)
     if klass is None:
         return None
     wet = _board_texture(p["community"])["wet"]
-    size = _SIZE_WET if wet else _SIZE_DRY
+    ex = _exploit_adjust(p)
+    size = min(1.25, max(0.25, (_SIZE_WET if wet else _SIZE_DRY) + ex["size"]))
+    val_bar = _VALUE_BET_EQ + ex["val_eq"]
+    raise_bar = _VALUE_RAISE_EQ + ex["raise_eq"]
     req = _required_equity(p)
 
     if p["can_check"]:
-        # No bet to us: value-bet with polarized sizing. Marginal made hands take
-        # thin value on dry boards only (pot-control / check when wet); a hand
-        # with no value just checks (no bluffing in this build).
-        if klass in ("STRONG", "MEDIUM") and eq >= _VALUE_BET_EQ:
-            return _make_raise(p, _bet_target(p, size))          # value, polarized size
-        if klass == "MARGINAL" and eq >= _VALUE_BET_EQ and not wet:
-            return _make_raise(p, _bet_target(p, _SIZE_DRY))     # thin value, dry only
-        return {"action": "check"}                               # pot control / give up
+        # Value-bet with (exploit-adjusted) polarized sizing; marginal made hands
+        # take thin value on dry only; else check — unless the bluff gate is open
+        # and we hold no made hand, in which case c-bet / semibluff the folders.
+        if klass in ("STRONG", "MEDIUM") and eq >= val_bar:
+            return _make_raise(p, _bet_target(p, size))
+        if klass == "MARGINAL" and eq >= val_bar and not wet:
+            thin = min(1.25, max(0.25, _SIZE_DRY + ex["size"]))
+            return _make_raise(p, _bet_target(p, thin))
+        if klass == "WEAK" and ex["allow_bluff"]:
+            b = _bluff_when_checked(p, wet, size)
+            if b is not None:
+                return b
+        return {"action": "check"}
 
     # ---- Facing a bet --------------------------------------------------------
     if klass == "STRONG":
-        if eq >= _VALUE_RAISE_EQ:
+        if eq >= raise_bar:
             return _make_raise(p, _bet_target(p, size))
         if eq >= req + _CALL_CUSHION:
             return _call_or_check(p)
         return {"action": "fold"}
 
     if klass == "MEDIUM":
-        # Overpair / TPGK: mirror baseline aggression (no EXTRA commitment beyond
-        # what the equity bar already allowed) — raise big eq, else call/fold.
-        if eq >= _VALUE_RAISE_EQ:
+        if eq >= raise_bar:
             return _make_raise(p, _bet_target(p, 0.7))
         if eq >= req + _CALL_CUSHION:
             return _call_or_check(p)
         return {"action": "fold"}
 
     if klass == "MARGINAL":
-        # Bluff-catch priced by texture + SPR (the guard already folded the deep
-        # stack-offs and downgraded value-raises). A bet is more credible on wet
-        # boards (draws got there) -> need more equity; cheaper when committed.
+        # Bluff-catch priced by texture + SPR + opponent type: vs a maniac the bar
+        # drops (call wider — their bets are air); vs a station/nit it rises (fold
+        # more — their bets are value). The 4a guard already folded the deep
+        # stack-offs upstream; this only moves the non-committed call/fold line.
         bar = req + _CALL_CUSHION + (0.05 if wet else 0.0) \
-            - (0.03 if _spr(p) <= _SPR_COMMIT else 0.0)
+            - (0.03 if _spr(p) <= _SPR_COMMIT else 0.0) + ex["bcatch"]
         if eq >= bar:
             return _call_or_check(p)
         return {"action": "fold"}
 
-    # WEAK: no made hand and no bluffing in this build — call only on a correct
-    # price (MC equity already reflects any draw), else fold.
+    # WEAK: semibluff-raise (check-raise) only if the gate is open; else call a
+    # correct price (MC equity already reflects any draw), else fold.
+    if ex["allow_bluff"]:
+        b = _bluff_when_facing(p, wet, size)
+        if b is not None:
+            return b
     if eq >= req + _CALL_CUSHION:
         return _call_or_check(p)
     return {"action": "fold"}
@@ -1013,6 +1373,13 @@ def decide(game_state):
         fallback = _fallback_action(p)
     except Exception:
         return {"action": "fold"}
+
+    # (3b) Update the opponent model from the cross-hand log (Phase 5, best-effort
+    # — never allowed to break a decision; failure just leaves opponents unknown).
+    try:
+        _observe(p)
+    except Exception:
+        pass
 
     # (4) Equity-driven strategy under guard + time budget.
     try:

@@ -1,19 +1,21 @@
 # PROGRESS.md — living state (update + commit WITH every phase checkpoint)
 
-- **Last updated:** 2026-05-30 22:40 BST
-- **HEAD:** `7ca9622` (Phase 4b checkpoint)  ·  **branch:** `mybot`
-- **NEXT STEP:** **HARD-STOP — Phase 5 needs explicit user sign-off.** Phase 4 is
-  DONE (4a guard + 4b texture/sizing/bluff-catch). Phase 5 = opponent modelling +
-  exploitation; the deferred 4b bluff initiative (c-bet / barrel / semibluff /
-  check-raise) folds into it because its EV is opponent-conditional.
+- **Last updated:** 2026-05-30 23:55 BST
+- **HEAD:** `70768e4` (Phase 5 checkpoint)  ·  **branch:** `mybot`
+- **NEXT STEP:** **Phase 6** — test harness hardening + threshold/grid tuning +
+  a regression gate. Open tuning items carried in: opponent-classifier thresholds
+  (absolute → consider relative-to-pool), all Phase-4/5 magic numbers. Phase 5
+  (opponent modelling + gated exploitation) is DONE; the HARD-STOP is cleared.
 - **How to resume:** `git checkout mybot` → read this file + `git log --oneline -10`
   → `python3 tools/harness.py` for the current baseline → continue at NEXT STEP.
 
 ## Cadence rule
 Stop for the user's OK after **every** phase (the user reviews every line).
-**HARD-STOP before Phase 5** (opponent modelling / exploitation — that's the edge;
-needs explicit sign-off before building). Do not roll into the next phase
-unprompted. Each phase ends on a runnable, validator-passing checkpoint.
+~~**HARD-STOP before Phase 5**~~ — CLEARED (Phase 5 built + approved). Do not roll
+into the next phase unprompted. Each phase ends on a runnable, validator-passing
+checkpoint. **Submission = `bots/mybot/bot.py` ONLY** — never commit engine/ or
+sandbox/ changes onto `mybot` (tooling tweaks for analysis must be reverted before
+a phase commit; the bot must run on the untouched engine).
 
 ## Phase status (0–7)
 | Phase | Status | Checkpoint commit(s) |
@@ -23,7 +25,7 @@ unprompted. Each phase ends on a runnable, validator-passing checkpoint.
 | 2 — Equity core (MC, eval7) | ✅ DONE | `2eb1b55`; tooling `1a9e319`; repro harness `4ed130c` |
 | 3 — Preflop as precomputed charts | ✅ DONE | `44b72c8` (docs `370bc33`) |
 | 4 — Postflop (texture, SPR, pot control) | ✅ DONE | 4a `7556ee5` · 4b `7ca9622` |
-| 5 — Opponent modelling + exploitation | ◻ TODO (HARD-STOP before) | — |
+| 5 — Opponent modelling + exploitation | ✅ DONE | `70768e4` |
 | 6 — Test harness + tuning + regression gate | ◻ TODO | — |
 | 7 — Package + validate + BOT_README | ◻ TODO | — |
 
@@ -87,11 +89,13 @@ unprompted. Each phase ends on a runnable, validator-passing checkpoint.
   tight opponents. Phase 4b adds texture+SPR-priced bluff-catching (folds marginal
   more on wet, calls wider when committed); full fix needs per-opponent reads
   (Phase 5).
-- **Unconditional postflop bluffing is −EV in this format** (Phase 4b finding) —
-  c-bets / barrels / semibluffs add variance, and variance is −EV in a bust-
-  elimination format (busts cost a fixed −10k floor). Their EV is opponent-
-  conditional → only profitable once we can c-bet the folders and never the
-  aggressor. **Deferred to Phase 5.**
+- ~~**Unconditional postflop bluffing is −EV in this format**~~ (Phase 4b finding) —
+  c-bets / barrels / semibluffs add variance, −EV in a bust-elimination format.
+  **RESOLVED Phase 5:** the same bluff layer, GATED to fire only when every live
+  opponent is a folder (nit / high fold-to-bet) and none is a station/maniac, is
+  significantly +EV (+560/match, p=0.026) AND reduces busts (35→33) — gating, not
+  the bluffs themselves, was the missing piece. "C-bet the folders, never the
+  aggressor."
 - ~~Preflop noisy MC~~ → **RESOLVED Phase 3**: O(1) chart lookup (position ×
   facing × stack bucket); push/fold gated at eff ≤ 15bb (100bb never shoves);
   HU ranges for the endgame. Uncovered spots still fall back to MC.
@@ -145,13 +149,45 @@ unprompted. Each phase ends on a runnable, validator-passing checkpoint.
   all 400 hands), so 30 seeds is too noisy to judge them — use ≥200-seed PAIRED
   A/B (common random numbers) + a t-test, not point estimates.
 
+## Phase 5 notes (opponent modelling + gated exploitation)
+- **Data substrate (verified):** `state["match_action_log"]` = original engine
+  injection (sandbox/match.py:221/298) — `{hand_num, seat, bot_id, action,
+  amount}`, rolling last-200, NO street markers, NO blinds. Bots receive ONLY
+  `action_request`/`warmup` — **no `hand_complete`/`revealed_cards`**, so card-
+  based showdown reads are IMPOSSIBLE (G1 drop confirmed). Bot reads the injected
+  state field; it does NOT depend on any sandbox/ change (re-verified: +560 result
+  reproduces on the untouched engine; engine/sandbox diff empty at commit).
+- **Model:** module-global `_OPP` keyed by stable `bot_id` (seat is not), fed by
+  `_observe`/`_fold_entry` from the cross-hand log via street-AGNOSTIC heuristics
+  (first-action-in-hand = preflop entry; facing-prior-aggression). Stats: VPIP,
+  PFR, agg%, fold-to-bet, fold-to-3bet. Shrinkage toward a HYBRID prior (fixed
+  Phase-0 base blended toward the running pooled field avg, G2). `_classify` →
+  station / maniac / nit / tag / unknown; `<_MIN_OBS=12` actions or no bucket →
+  unknown → baseline. Exploit magnitude scales with confidence n/(n+K).
+- **Exploits** (modulate 4a/4b; NEVER bypass the 4a guard): vs station — value
+  thinner+bigger, fold more to their raises; vs maniac — widen bluff-catch; vs nit
+  — smaller value, overfold their bets; the gated 4b bluff layer re-enables only
+  when ALL live opps are folders and none station/maniac.
+- **Classifier reality check (why the A/B still won):** label-accuracy vs my
+  Phase-0 ground truth was only 1/5 — but my LABELS were wrong (math/ref_bot_2
+  "call only ≥3:1" = foldy ROCKS, not calling stations; the field has no true
+  stations/maniacs and the aggressor busts too fast (n≈15) to register). The
+  classifier is FUNCTIONALLY correct: folders→nit→overfold+bluff (+EV), and the
+  aggressor lands tag/unknown→NOT in the foldy set→bluff gate stays CLOSED when
+  it's live (so "never bluff the aggressor" holds despite the missed maniac
+  label). Absolute thresholds kept (G4/Phase-6 question: relative-to-pool).
+- **A/B (200-seed paired, untouched engine):** engine-only +469 (p=0.059, CI
+  [−15,+953] → neutral-or-better ✓); engine+bluff **+560 (p=0.026, CI
+  [+70,+1050] → strictly positive ✓)**, busts 33 vs 35. Both flags shipped ON.
+
 ## Current performance (baseline to beat)
 Deterministic PAIRED A/B (harness.py: seeded refs + `BOT_RNG_SEED`, common random
 numbers):
-- **Phase 4b: statistically neutral vs 4a** (200-seed paired diff −607,
-  CI [−1,789, +576], p=0.32; busts 35 vs 33/200). Mean level ≈ +15.2k.
-- Phase 4a: mean +16,804 (30-seed) / +15,868 (200-seed), ~24/30 wins, 5 busts;
-  paired +50 vs Phase 3, 0 new busts.
-- Phase 3 charts: mean +16,754 (30-seed). Phase 2: +11.5k.
-Validator: PASSED. Equity: 5/5. Worst-case `decide()` ~4 ms (~8 ms @ 0.5 core);
-budget caps 1.2 s. Determinism: `harness.py --check` = YES.
+- **Phase 5 (engine + gated bluff): +560/match vs Phase 4b** (200-seed paired,
+  p=0.026, 95% CI [+70, +1050]); busts 33 vs 35/200. Mean level ≈ +15.8k.
+  First statistically-significant EV gain since Phase 3; expected to be larger vs
+  the heterogeneous 500-bot field (the 5 refs can't exercise station/maniac play).
+- Phase 4b: statistically neutral vs 4a (paired −607, CI [−1,789,+576], p=0.32).
+- Phase 4a: +15,868 (200-seed). Phase 3: +16,754 (30-seed). Phase 2: +11.5k.
+Validator: PASSED. Equity: 5/5. Worst-case `decide()` ~4.4 ms (~8.7 ms @ 0.5
+core); budget caps 1.2 s. Determinism: `harness.py --check` = YES.
