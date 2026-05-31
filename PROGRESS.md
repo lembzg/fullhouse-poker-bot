@@ -1,12 +1,13 @@
 # PROGRESS.md — living state (update + commit WITH every phase checkpoint)
 
-- **Last updated:** 2026-05-31 01:20 BST
-- **HEAD:** `150b9d8` (Phase 6 checkpoint, tooling-only)  ·  **branch:** `mybot`
-- **NEXT STEP:** **Phase 7** — packaging + final validate + BOT_README. The
-  submission artifact is already proven clean (single self-contained `bot.py`,
-  passes the validator in isolation; see "Submission status" below). Phase 6 is
-  DONE: third-party test + tuning sweep + regression gate, `bot.py` UNCHANGED
-  (tuning found nothing significant under the gate).
+- **Last updated:** 2026-05-31 01:40 BST
+- **HEAD:** `20f76a9` (Phase 7 checkpoint, packaging — bot.py unchanged)  ·  **branch:** `mybot`
+- **NEXT STEP:** **OPTIONAL: adversarial-state hardening** (malformed states,
+  all-in-for-less, heads-up transition, latency under real 0.5-core load) — the
+  last pass, **awaiting explicit user go** (do not start unprompted). The bot is
+  otherwise submission-ready: single-file `bot.py` verified on Python 3.10.
+- **Phase 7 DONE:** 3.10 runtime verified, BOT_README written, single-file artifact
+  confirmed, final validator pass green on 3.10 + 3.13. `bot.py` UNCHANGED.
 - **How to resume:** `git checkout mybot` → read this file + `git log --oneline -10`
   → `python3 tools/harness.py` for the current baseline → continue at NEXT STEP.
 
@@ -28,7 +29,7 @@ a phase commit; the bot must run on the untouched engine).
 | 4 — Postflop (texture, SPR, pot control) | ✅ DONE | 4a `7556ee5` · 4b `7ca9622` |
 | 5 — Opponent modelling + exploitation | ✅ DONE | `70768e4` |
 | 6 — Test harness + tuning + regression gate | ✅ DONE (bot.py unchanged) | `150b9d8` |
-| 7 — Package + validate + BOT_README | ◻ TODO | — |
+| 7 — Package + validate + BOT_README | ✅ DONE (bot.py unchanged) | `20f76a9` |
 
 ## Standing decisions
 - **Bust rate vs competent contesters is ~30% and is VARIANCE, not a leak**
@@ -44,6 +45,17 @@ a phase commit; the bot must run on the untouched engine).
 - **Tooling/test changes never ride a `bot.py` commit** and are reverted before
   any phase checkpoint that touches the bot (the bot must run on the untouched
   engine; verified Phase 5).
+- **The opponent classifier's maniac/station thresholds are NOT widened — by
+  decision (Phase 7), this stays a documented known-limitation, not a fix.**
+  Reasoning: (1) the LAG test showed that vs aggressive spewers MORE discipline
+  wins (honest_equity beat us by harvesting spew at low variance), so "catch the
+  maniac and contest more" points the WRONG way — it would increase contesting
+  against the very opponent already busting us ~59%. (2) Any threshold change is a
+  bet on the unseen real-field composition, validated only against self-written
+  bots — the overfitting trap recursing (same error as tuning to the refs). (3)
+  The bot is +EV vs BOTH tested populations (dominant vs foldy +15k; positive vs
+  LAG +8.8k). That robustness is where to stop. `unknown → safe baseline` is
+  working as designed. **Do not widen on the strength of one self-written field.**
 - **Packaging:** single-file `bots/mybot/bot.py` for now; switch to `.zip` + `data/`
   only if Phase 3 tables exceed what's sane to inline (169-grid is tiny → likely
   stays inline). Decided in Phase 0.
@@ -241,3 +253,31 @@ core); budget caps 1.2 s. Determinism: `harness.py --check` = YES.
   derivable from the inline shorthand, so single-file and dir/zip submissions agree.
 - Phase 7 remaining: decide single-file vs zip+data (single-file is sufficient and
   recommended), write BOT_README, final validate, package.
+
+## Phase 7 notes (packaging + 3.10 verification + overfitting test)
+- **Python 3.10 runtime VERIFIED (the one real open risk — now closed):** provisioned
+  a real 3.10.20 venv (uv), built eval7 from source there (needs Cython+setuptools
+  as build deps; longintrepr.h present on 3.10). On 3.10: eval7 imports + evaluates;
+  validator PASSES on the ISOLATED single-file; a full 400-hand match runs with
+  `bot_errors: NONE`; equity tests 5/5. Final validator pass green on BOTH 3.10 and
+  3.13. No forbidden imports. Artifact = `bots/mybot/bot.py`, 57,214 bytes,
+  sha256 27c323af9aecaaf7e9ad62bcbc87c429a4e1c58bb881e154ecb3d620d39b2557.
+- **BOT_README.md** written (name "Quant", approach, safety, deps=eval7, runtime).
+- **Overfitting test (2nd independent opponent, `bots/lag_bot/bot.py` = loose-
+  aggressive):** 200-seed LAG field [mybot, lag_bot, honest_equity, aggressor,
+  mathematician, template]: mybot mean **+8,795, 69/200 wins, 118/200 busts (59%)**.
+  honest_equity WON the field (+15,895, 103 wins) — a disciplined TAG with no
+  opponent model beats us in a spew-heavy field by harvesting the LAG at low
+  variance. Classifier put lag_bot in `unknown` (aggr 0.52 < maniac floor 0.55,
+  vpip 0.63 > tag ceiling 0.50 → gap) so NO exploit fired; the maniac path DID
+  fire for the seeded aggressor (aggr 0.65, n=355). Conclusion: baseline is +EV
+  vs the LAG (safety net works) but the exploit edge does NOT generalize to
+  aggressive contesters — see the "no maniac-threshold widen" standing decision.
+
+## Pre-submit checklist (portal upload)
+1. Artifact = `bots/mybot/bot.py` ONLY (single file; no zip/data needed). [verified]
+2. Validator PASS on the isolated file, Python 3.10. [verified]
+3. eval7 is the only third-party import; no forbidden imports. [verified]
+4. `BOT_NAME = "Quant"` set; warmup handled. [in bot.py]
+5. Confirm portal's expected filename/field for the single-file upload (portal-side).
+6. (Optional, pre-submit) adversarial-state hardening pass — see NEXT STEP; awaiting go.
