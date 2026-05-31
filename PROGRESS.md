@@ -1,13 +1,13 @@
 # PROGRESS.md — living state (update + commit WITH every phase checkpoint)
 
-- **Last updated:** 2026-05-31 01:40 BST
-- **HEAD:** `20f76a9` (Phase 7 checkpoint, packaging — bot.py unchanged)  ·  **branch:** `mybot`
-- **NEXT STEP:** **OPTIONAL: adversarial-state hardening** (malformed states,
-  all-in-for-less, heads-up transition, latency under real 0.5-core load) — the
-  last pass, **awaiting explicit user go** (do not start unprompted). The bot is
-  otherwise submission-ready: single-file `bot.py` verified on Python 3.10.
-- **Phase 7 DONE:** 3.10 runtime verified, BOT_README written, single-file artifact
-  confirmed, final validator pass green on 3.10 + 3.13. `bot.py` UNCHANGED.
+- **Last updated:** 2026-05-31 02:05 BST
+- **HEAD:** `efcc89e` (adversarial-pass closeout — PROGRESS + tools only)  ·  **branch:** `mybot`
+- **STATUS: ✅ SUBMISSION-COMPLETE.** Phases 0–7 done + adversarial-state hardening
+  pass CLEAN. Upload artifact = **`bots/mybot/bot.py`** (single file, sha256
+  `27c323af9aecaaf7e9ad62bcbc87c429a4e1c58bb881e154ecb3d620d39b2557`), verified on
+  Python 3.10. `bot.py` has been UNCHANGED since the Phase 5 commit (`5d467fa`).
+- **NEXT STEP:** none required — ready to upload. (Re-verify after any future
+  change with `tools/regression_gate.py` + `tools/adversarial_test.py`.)
 - **How to resume:** `git checkout mybot` → read this file + `git log --oneline -10`
   → `python3 tools/harness.py` for the current baseline → continue at NEXT STEP.
 
@@ -281,3 +281,19 @@ core); budget caps 1.2 s. Determinism: `harness.py --check` = YES.
 4. `BOT_NAME = "Quant"` set; warmup handled. [in bot.py]
 5. Confirm portal's expected filename/field for the single-file upload (portal-side).
 6. (Optional, pre-submit) adversarial-state hardening pass — see NEXT STEP; awaiting go.
+
+## Adversarial-state hardening pass (final pre-submission verification)
+Pure downside-elimination on the EXACT artifact (sha 27c323af) under Python
+3.10.20 — verification only, `bot.py` untouched. Captured in `tools/adversarial_test.py`
+(re-runnable: `python3 tools/adversarial_test.py [path] [--hogs N]`).
+- **26/26 hostile/malformed states** (missing keys, None/garbage cards, neg/zero
+  pot, 1-chip stack, owed>stack, malformed players, non-action message types, etc.)
+  → every one returned a LEGAL action, **0 throws**. Fallback-first design holds.
+- **6/6 tricky-but-legal spots** (all-in-for-less, side pots, multiway all-in,
+  6-max→HU SB-to-act, short-stack HU, all-in-only) → legal + sane.
+- **Latency:** cpulimit is a no-op on Apple Silicon, so throttled via CPU
+  contention to ~0.30 core (HARSHER than the prod 0.5 core, confirmed 3.3x busy-loop
+  slowdown). Worst-case decide() (HU river, 2500 iters): median 6ms, p99 47ms,
+  **MAX 56ms — 1944ms margin to the 2s cliff (~97%)**. Wall-clock budget guard
+  bailed a 50M-iter request at 1.200s even while throttled. Full-speed worst-case
+  ~4.4ms. No path approaches the auto-fold cliff.
