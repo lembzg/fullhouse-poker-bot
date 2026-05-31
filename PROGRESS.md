@@ -1,11 +1,12 @@
 # PROGRESS.md — living state (update + commit WITH every phase checkpoint)
 
-- **Last updated:** 2026-05-30 23:55 BST
-- **HEAD:** `70768e4` (Phase 5 checkpoint)  ·  **branch:** `mybot`
-- **NEXT STEP:** **Phase 6** — test harness hardening + threshold/grid tuning +
-  a regression gate. Open tuning items carried in: opponent-classifier thresholds
-  (absolute → consider relative-to-pool), all Phase-4/5 magic numbers. Phase 5
-  (opponent modelling + gated exploitation) is DONE; the HARD-STOP is cleared.
+- **Last updated:** 2026-05-31 01:20 BST
+- **HEAD:** `150b9d8` (Phase 6 checkpoint, tooling-only)  ·  **branch:** `mybot`
+- **NEXT STEP:** **Phase 7** — packaging + final validate + BOT_README. The
+  submission artifact is already proven clean (single self-contained `bot.py`,
+  passes the validator in isolation; see "Submission status" below). Phase 6 is
+  DONE: third-party test + tuning sweep + regression gate, `bot.py` UNCHANGED
+  (tuning found nothing significant under the gate).
 - **How to resume:** `git checkout mybot` → read this file + `git log --oneline -10`
   → `python3 tools/harness.py` for the current baseline → continue at NEXT STEP.
 
@@ -26,10 +27,23 @@ a phase commit; the bot must run on the untouched engine).
 | 3 — Preflop as precomputed charts | ✅ DONE | `44b72c8` (docs `370bc33`) |
 | 4 — Postflop (texture, SPR, pot control) | ✅ DONE | 4a `7556ee5` · 4b `7ca9622` |
 | 5 — Opponent modelling + exploitation | ✅ DONE | `70768e4` |
-| 6 — Test harness + tuning + regression gate | ◻ TODO | — |
+| 6 — Test harness + tuning + regression gate | ✅ DONE (bot.py unchanged) | `150b9d8` |
 | 7 — Package + validate + BOT_README | ◻ TODO | — |
 
 ## Standing decisions
+- **Bust rate vs competent contesters is ~30% and is VARIANCE, not a leak**
+  (Phase 6, honest_equity field). Diagnosed split of bust hands: **89% unavoidable**
+  (16/28 postflop two-pair+ coolers, 9/28 preflop AK/AQ/pair races) vs **11%**
+  postflop one-pair/TPGK stack-offs — and all of those were as the AGGRESSOR
+  (we drove the betting), which the facing-bet-only 4a guard cannot reach.
+  **No +EV commitment fix exists under the gate:** an aggressor-side cap on
+  TPTK/overpair/one-pair would sacrifice value on the many hands that get paid
+  (the Phase 4a additive trap) and would not clear. **DO NOT re-litigate / do not
+  build aggressor-side caps without new evidence.** Tune commitment leaks ONLY on
+  a field that contests pots (honest_equity), never the fold-happy refs.
+- **Tooling/test changes never ride a `bot.py` commit** and are reverted before
+  any phase checkpoint that touches the bot (the bot must run on the untouched
+  engine; verified Phase 5).
 - **Packaging:** single-file `bots/mybot/bot.py` for now; switch to `.zip` + `data/`
   only if Phase 3 tables exceed what's sane to inline (169-grid is tiny → likely
   stays inline). Decided in Phase 0.
@@ -191,3 +205,39 @@ numbers):
 - Phase 4a: +15,868 (200-seed). Phase 3: +16,754 (30-seed). Phase 2: +11.5k.
 Validator: PASSED. Equity: 5/5. Worst-case `decide()` ~4.4 ms (~8.7 ms @ 0.5
 core); budget caps 1.2 s. Determinism: `harness.py --check` = YES.
+
+## Phase 6 notes (third-party test + tuning + regression gate)
+- **Third-party opponent:** rlcard installs but ships NO competent NLHE agent
+  (only RandomAgent / untrained DQN-NFSP-DMC; CFR + pretrained models are tabular
+  Leduc/Limit only), so per plan we used `bots/honest_equity/bot.py` — a competent,
+  INDEPENDENTLY-coded equity TAG (no shared code, no charts/SPR/opponent-model;
+  pure equity vs pot odds; deterministic under BOT_RNG_SEED). `tools/eval_field.py`
+  runs the 6-max HONEST_FIELD (refs minus the redundant ref_bot_2, plus honest_equity).
+- **Result (200 seeds, honest field):** mybot mean **+14,997, 111/200 wins**, beats
+  honest_equity (+2,713). Edge is real, not echo-chamber. Bust rate 63/200 (~31%)
+  vs 33/200 in the all-refs field — diagnosed as variance (see standing decision).
+  mybot busts ~half as often as the unguarded honest_equity (63 vs 119) → 4a guard works.
+- **Tuning sweep (200-seed paired vs HEAD, ref field):** SHRINK_K 20→12 (+190,p=.44),
+  MIN_OBS 12→8 (no-op, identical), nit bcatch .12→.16 (+103,p=.24), SIZE_WET .70→.60
+  (+427,p=.16). ALL statistically neutral (every CI includes 0) → **committed none;
+  bot.py unchanged.** NOTE: ref-field tuning cannot surface commitment leaks (refs
+  don't contest) — that critique drove the honest-field bust split above.
+- **Regression gate** (`tools/regression_gate.py`, runnable, exit 0/1): a candidate
+  is ACCEPTed only if (A) not significantly worse heads-up vs prev HEAD (seat-
+  alternated, judged by CI), (B) no regression vs the ref field, (C) no regression
+  vs the honest_equity contester field — all paired vs HEAD, neutral-or-better (CI
+  hi ≥ 0). Use it on every future bot.py change.
+
+## Submission status (the real upload artifact)
+- **Single self-contained `bots/mybot/bot.py`** — 1,398 lines / 57 KB (≪ 5 MB cap).
+- **Passes the validator IN ISOLATION:** copying ONLY bot.py to an empty dir and
+  validating it there → PASSED (this is exactly how `match.py` mounts a `.py`
+  submission). So the uploaded file = the tested file.
+- **Zero runtime dependency outside bot.py:** imports are `time/random/os/eval7`
+  (+ conditional `json`). The only file I/O is an OPTIONAL same-dir
+  `data/preflop.json` (or `$BOT_DATA_DIR`); absent → identical inline charts. It
+  does NOT touch `tools/`, `honest_equity`, `eval_field`, or any sibling (the two
+  `tools/...` strings in bot.py are comments). `data/preflop.json` is byte-for-byte
+  derivable from the inline shorthand, so single-file and dir/zip submissions agree.
+- Phase 7 remaining: decide single-file vs zip+data (single-file is sufficient and
+  recommended), write BOT_README, final validate, package.
